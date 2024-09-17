@@ -41,11 +41,16 @@ func (p *pusher) Push(ctx context.Context, event string, data any) error {
 	p.w.Write(singleEnter)
 
 	p.w.Write(dataPrefix)
-	err := json.NewEncoder(p.w).Encode(data)
-	if err != nil {
-		return err
+
+	if v, ok := data.(string); ok {
+		p.w.Write([]byte(v))
+	} else {
+		err := json.NewEncoder(p.w).Encode(data)
+		if err != nil {
+			return err
+		}
 	}
-	p.w.Write(singleEnter)
+	p.w.Write(doubleEnters)
 
 	p.out.Flush()
 

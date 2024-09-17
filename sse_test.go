@@ -30,7 +30,10 @@ func TestSSE(t *testing.T) {
 
 	ch := sse.Receive(ctx, w.Result().Body)
 
-	msg := <-ch
+	msg, ok := <-ch
+	if !ok {
+		t.Fatal("expected message, got closed channel")
+	}
 
 	if msg.Id != 1 {
 		t.Fatalf("expected id 1, got %d", msg.Id)
@@ -40,7 +43,7 @@ func TestSSE(t *testing.T) {
 		t.Fatalf("expected event event, got %s", msg.Event)
 	}
 
-	if string(msg.Data) != `"data"` {
+	if string(msg.Data) != `data` {
 		t.Fatalf(`expected data "data", got %s`, string(msg.Data))
 	}
 
