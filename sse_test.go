@@ -3,6 +3,7 @@ package sse_test
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"ella.to/sse"
@@ -59,5 +60,31 @@ func TestSSE(t *testing.T) {
 
 	if string(msg.Data) != `{}` {
 		t.Fatalf(`expected data {}, got %s`, string(msg.Data))
+	}
+}
+
+func TestWriteEvent(t *testing.T) {
+	var sb strings.Builder
+
+	sample := struct {
+		Name string
+	}{
+		Name: "hello",
+	}
+
+	err := sse.WriteEvent(&sb, 1, "event", sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = sse.WriteEvent(&sb, 1, "event", sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := sb.String()
+
+	if result != "id: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\nid: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\n" {
+		t.Fatalf("expected %s, got %s", "id: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\nid: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\n", result)
 	}
 }

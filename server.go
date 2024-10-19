@@ -3,8 +3,10 @@ package sse
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 type Pusher interface {
@@ -13,7 +15,7 @@ type Pusher interface {
 }
 
 type pusher struct {
-	w   http.ResponseWriter
+	w   io.Writer
 	out http.Flusher
 	id  int
 }
@@ -23,34 +25,9 @@ var _ Pusher = (*pusher)(nil)
 func (p *pusher) Push(ctx context.Context, event string, data any) error {
 	p.id++
 
-	if err, ok := data.(error); ok {
-		data = struct {
-			Error string `json:"error"`
-		}{
-			Error: err.Error(),
-		}
-		event = "error"
+	if err := WriteEvent(p.w, p.id, event, data); err != nil {
+		return err
 	}
-
-	p.w.Write(idPrefix)
-	p.w.Write([]byte(strconv.Itoa(p.id)))
-	p.w.Write(singleEnter)
-
-	p.w.Write(eventPrefix)
-	p.w.Write([]byte(event))
-	p.w.Write(singleEnter)
-
-	p.w.Write(dataPrefix)
-
-	if v, ok := data.(string); ok {
-		p.w.Write([]byte(v))
-	} else {
-		err := json.NewEncoder(p.w).Encode(data)
-		if err != nil {
-			return err
-		}
-	}
-	p.w.Write(doubleEnters)
 
 	p.out.Flush()
 
@@ -102,4 +79,75 @@ func CreatePusher(w http.ResponseWriter, argsFns ...OptionFunc) (*pusher, error)
 		w:   w,
 		out: out,
 	}, nil
+}
+
+func WriteEvent(w io.Writer, id int, event string, data any) error {
+	if err, ok := data.(error); ok {
+		data = struct {
+			Error string `json:"error"`
+		}{
+			Error: err.Error(),
+		}
+		event = "error"
+	}
+
+	var err error
+
+	_, err = w.Write(idPrefix)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte(strconv.Itoa(id)))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(singleEnter)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(eventPrefix)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write([]byte(event))
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(singleEnter)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(dataPrefix)
+	if err != nil {
+		return err
+	}
+
+	if v, ok := data.(string); ok {
+		// NOTE: because SSE requires to have 2 new lines to separate the event
+		// all the data should be trimmed to avoid any extra new lines
+		_, err = w.Write([]byte(strings.TrimSpace(v)))
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(doubleEnters)
+		if err != nil {
+			return err
+		}
+	} else {
+		// NOTE: json.NewEncode will add a new line at the end of the data
+		// as a result, we need to add just one new line to separate the event
+		err := json.NewEncoder(w).Encode(data)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(singleEnter)
+		if err != nil {
+			return err
+		}
+	}
+	return err
 }
