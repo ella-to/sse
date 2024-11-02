@@ -2,89 +2,111 @@ package sse_test
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"ella.to/sse"
 )
 
-func TestSSE(t *testing.T) {
-	ctx := context.Background()
+func TestParse(t *testing.T) {
+	r := strings.NewReader("data: hello\n\n")
+	ch := sse.Parse(r)
 
-	w := httptest.NewRecorder()
-
-	pusher, err := sse.CreatePusher(w, sse.WithHeader("Sample-Id", "123"))
-	if err != nil {
-		t.Fatal(err)
+	msg := <-ch
+	if msg.Id != nil {
+		t.Errorf("Expected Id to be nil, got %s", *msg.Id)
 	}
-
-	err = pusher.Push(ctx, "event", "data")
-	if err != nil {
-		t.Fatal(err)
+	if msg.Event != "" {
+		t.Errorf("Expected Event to be empty, got %s", msg.Event)
 	}
-
-	err = pusher.Done(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ch := sse.Receive(ctx, w.Result().Body)
-
-	msg, ok := <-ch
-	if !ok {
-		t.Fatal("expected message, got closed channel")
-	}
-
-	if msg.Id != 1 {
-		t.Fatalf("expected id 1, got %d", msg.Id)
-	}
-
-	if msg.Event != "event" {
-		t.Fatalf("expected event event, got %s", msg.Event)
-	}
-
-	if string(msg.Data) != `data` {
-		t.Fatalf(`expected data "data", got %s`, string(msg.Data))
-	}
-
-	msg = <-ch
-
-	if msg.Id != 2 {
-		t.Fatalf("expected id 2, got %d", msg.Id)
-	}
-
-	if msg.Event != "done" {
-		t.Fatalf("expected event done, got %s", msg.Event)
-	}
-
-	if string(msg.Data) != `{}` {
-		t.Fatalf(`expected data {}, got %s`, string(msg.Data))
+	if *msg.Data != "hello" {
+		t.Errorf("Expected Data to be hello, got %s", *msg.Data)
 	}
 }
 
-func TestWriteEvent(t *testing.T) {
-	var sb strings.Builder
-
-	sample := struct {
-		Name string
-	}{
-		Name: "hello",
-	}
-
-	err := sse.WriteEvent(&sb, 1, "event", sample)
+func TestParseLarge(t *testing.T) {
+	file, err := os.Open("./testdata/test01.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer file.Close()
 
-	err = sse.WriteEvent(&sb, 1, "event", sample)
-	if err != nil {
-		t.Fatal(err)
+	ch := sse.Parse(file)
+	for msg := range ch {
+		fmt.Printf("%s", msg)
+	}
+}
+
+func TestPusherReceiver(t *testing.T) {
+	n := 100000
+	c := 10
+
+	var wg sync.WaitGroup
+
+	wg.Add(c)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pusher, err := sse.NewPusher(w)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		var msg sse.Message
+
+		for i := range n {
+			id := fmt.Sprintf("id-%d", i)
+			event := "event"
+			data := fmt.Sprintf("data-%d", i)
+
+			msg.Id = &id
+			msg.Event = event
+			msg.Data = &data
+
+			err = pusher.Push(&msg)
+			if err != nil {
+				break
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := http.Client{}
+
+	for range c {
+		go func() {
+			defer wg.Done()
+
+			req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer resp.Body.Close()
+
+			r := sse.NewReceiver(resp.Body)
+
+			for {
+				msg, err := r.Receive(context.Background())
+				if err != nil {
+					break
+				}
+
+				fmt.Printf("%s", msg)
+			}
+		}()
 	}
 
-	result := sb.String()
-
-	if result != "id: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\nid: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\n" {
-		t.Fatalf("expected %s, got %s", "id: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\nid: 1\nevent: event\ndata: {\"Name\":\"hello\"}\n\n", result)
-	}
+	wg.Wait()
 }
