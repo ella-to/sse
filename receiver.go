@@ -8,10 +8,12 @@ import (
 )
 
 type receiver struct {
-	ch <-chan *Message
+	ch    <-chan *Message
+	close func() error
 }
 
 var _ Receiver = &receiver{}
+var _ io.Closer = &receiver{}
 
 func (r *receiver) Receive(ctx context.Context) (*Message, error) {
 	select {
@@ -25,9 +27,14 @@ func (r *receiver) Receive(ctx context.Context) (*Message, error) {
 	}
 }
 
+func (r *receiver) Close() error {
+	return r.close()
+}
+
 func NewReceiver(rc io.ReadCloser) Receiver {
 	return &receiver{
-		ch: Parse(rc),
+		ch:    Parse(rc),
+		close: rc.Close,
 	}
 }
 

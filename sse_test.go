@@ -103,7 +103,8 @@ func TestPusherReceiver(t *testing.T) {
 					break
 				}
 
-				fmt.Printf("%s", msg)
+				_ = msg
+				// fmt.Printf("%s", msg)
 			}
 		}()
 	}
