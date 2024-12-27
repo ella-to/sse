@@ -7,10 +7,19 @@ import (
 
 type Pusher interface {
 	Push(msg *Message) error
+	Close()
 }
 
 type Receiver interface {
 	Receive(ctx context.Context) (*Message, error)
+}
+
+type StringWriter interface {
+	WriteString(string) (int, error)
+}
+
+type StringEncoder interface {
+	EncodeString(StringWriter)
 }
 
 type Message struct {
@@ -19,28 +28,42 @@ type Message struct {
 	Data  *string
 }
 
-func (m *Message) String() string {
-	var sb strings.Builder
+var _ StringEncoder = (*Message)(nil)
 
+func (m *Message) EncodeString(sw StringWriter) {
 	if m.Id != nil {
-		sb.WriteString("id: ")
-		sb.WriteString(*m.Id)
-		sb.WriteString("\n")
+		sw.WriteString("id: ")
+		sw.WriteString(*m.Id)
+		sw.WriteString("\n")
 	}
 
 	if m.Event != "" {
-		sb.WriteString("event: ")
-		sb.WriteString(m.Event)
-		sb.WriteString("\n")
+		sw.WriteString("event: ")
+		sw.WriteString(m.Event)
+		sw.WriteString("\n")
 	}
 
 	if m.Data != nil {
-		sb.WriteString("data: ")
-		sb.WriteString(*m.Data)
-		sb.WriteString("\n")
+		sw.WriteString("data: ")
+		sw.WriteString(*m.Data)
+		sw.WriteString("\n")
 	}
 
-	sb.WriteString("\n")
+	sw.WriteString("\n")
+}
+
+func (m *Message) String() string {
+	var sb strings.Builder
+
+	m.EncodeString(&sb)
 
 	return sb.String()
+}
+
+type Ping struct{}
+
+var _ StringEncoder = (*Ping)(nil)
+
+func (p *Ping) EncodeString(sw StringWriter) {
+	sw.WriteString(": ping\n\n")
 }

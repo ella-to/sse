@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"ella.to/sse"
 )
@@ -37,6 +38,7 @@ func TestParseLarge(t *testing.T) {
 	defer file.Close()
 
 	ch := sse.Parse(file)
+
 	for msg := range ch {
 		fmt.Printf("%s", msg)
 	}
@@ -51,11 +53,12 @@ func TestPusherReceiver(t *testing.T) {
 	wg.Add(c)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pusher, err := sse.NewPusher(w)
+		pusher, err := sse.NewPusher(w, 10*time.Second)
 		if err != nil {
 			t.Error(err)
 			return
 		}
+		defer pusher.Close()
 
 		var msg sse.Message
 

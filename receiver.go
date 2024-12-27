@@ -65,6 +65,9 @@ func Parse(r io.Reader) <-chan *Message {
 
 func parseMessage(r io.Reader, buffer *bytes.Buffer) (*Message, error) {
 	msg := &Message{}
+
+	lastMsgWasComment := false
+
 	for {
 		buffer.Reset()
 
@@ -76,12 +79,17 @@ func parseMessage(r io.Reader, buffer *bytes.Buffer) (*Message, error) {
 		line := buffer.Bytes()
 
 		if len(line) == 0 {
+			if lastMsgWasComment {
+				lastMsgWasComment = false
+				continue
+			}
 			break
 		}
 
 		// it means that the line is a comment
 		// and we can ignore it
 		if line[0] == ':' {
+			lastMsgWasComment = true
 			continue
 		}
 
