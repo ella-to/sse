@@ -5,6 +5,10 @@ import (
 	"strings"
 )
 
+const (
+	Version = "0.0.7"
+)
+
 type Pusher interface {
 	Push(msg *Message) error
 	Close()
