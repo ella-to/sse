@@ -32,7 +32,7 @@ go get ella.to/sse
 const pingTimeout = 30 * time.Second
 
 func MyHandler(w http.ResponseWriter, r *http.Request) {
-    pusher, err := sse.NewPusher(w, pingTimeout)
+    pusher, err := sse.NewHttpPusher(w, pingTimeout)
     if err != nil {
         t.Error(err)
         return

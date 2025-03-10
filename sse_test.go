@@ -19,15 +19,16 @@ func TestParse(t *testing.T) {
 	ch := sse.Parse(r)
 
 	msg := <-ch
-	if msg.Id != nil {
-		t.Errorf("Expected Id to be nil, got %s", *msg.Id)
+	if msg.Data != "hello" {
+		t.Error("Data mismatch")
+	}
+	if msg.Id != "" {
+		t.Error("Id mismatch")
 	}
 	if msg.Event != "" {
-		t.Errorf("Expected Event to be empty, got %s", msg.Event)
+		t.Error("Event mismatch")
 	}
-	if *msg.Data != "hello" {
-		t.Errorf("Expected Data to be hello, got %s", *msg.Data)
-	}
+
 }
 
 func TestParseLarge(t *testing.T) {
@@ -53,7 +54,7 @@ func TestPusherReceiver(t *testing.T) {
 	wg.Add(c)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pusher, err := sse.NewPusher(w, 10*time.Second)
+		pusher, err := sse.NewHttpPusher(w, 10*time.Second)
 		if err != nil {
 			t.Error(err)
 			return
@@ -63,13 +64,9 @@ func TestPusherReceiver(t *testing.T) {
 		var msg sse.Message
 
 		for i := range n {
-			id := fmt.Sprintf("id-%d", i)
-			event := "event"
-			data := fmt.Sprintf("data-%d", i)
-
-			msg.Id = &id
-			msg.Event = event
-			msg.Data = &data
+			msg.Id = fmt.Sprintf("id-%d", i)
+			msg.Event = "event"
+			msg.Data = fmt.Sprintf("data-%d", i)
 
 			err = pusher.Push(&msg)
 			if err != nil {
@@ -107,7 +104,6 @@ func TestPusherReceiver(t *testing.T) {
 				}
 
 				_ = msg
-				// fmt.Printf("%s", msg)
 			}
 		}()
 	}
