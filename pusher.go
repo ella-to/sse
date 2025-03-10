@@ -1,31 +1,41 @@
 package sse
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"sync"
 	"time"
 )
 
-var ping = &Ping{}
+//
+// PushWriter
+//
 
-type pusher struct {
+type PushWriter struct {
 	w            io.Writer
-	out          http.Flusher
 	mtx          sync.Mutex
-	clearTimeout func()
 	timeout      time.Duration
-	buffer       bytes.Buffer
+	clearTimeout func()
 }
 
-var _ Pusher = &pusher{}
+func (p *PushWriter) Push(msg *Message) error {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
 
-func (p *pusher) Push(msg *Message) error {
-	return p.push(msg)
+	if p.clearTimeout != nil && p.timeout > 0 {
+		p.clearTimeout()
+		p.clearTimeout = setTimeout(p.timeout, p.ping)
+	}
+
+	_, err := io.Copy(p.w, msg)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (p *pusher) Close() {
+func (p *PushWriter) Close() error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
@@ -33,35 +43,26 @@ func (p *pusher) Close() {
 		p.clearTimeout()
 		p.clearTimeout = nil
 	}
-}
-
-func (p *pusher) push(enc StringEncoder) error {
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
-
-	p.buffer.Reset()
-	enc.EncodeString(&p.buffer)
-
-	if p.clearTimeout != nil && p.timeout > 0 {
-		p.clearTimeout()
-		p.clearTimeout = setTimeout(p.timeout, p.ping)
-	}
-
-	_, err := p.w.Write(p.buffer.Bytes())
-	if err != nil {
-		return err
-	}
-
-	p.out.Flush()
 
 	return nil
 }
 
-func (p *pusher) ping() {
-	p.push(ping)
+func (p *PushWriter) ping() {
+	p.Push(NewPingEvent())
 }
 
-func NewPusher(w http.ResponseWriter, timeout time.Duration) (Pusher, error) {
+func NewPushWriter(w io.Writer, timeout time.Duration) *PushWriter {
+	return &PushWriter{
+		w:       w,
+		timeout: timeout,
+	}
+}
+
+//
+// Http Pusher
+//
+
+func NewHttpPusher(w http.ResponseWriter, timeout time.Duration) (Pusher, error) {
 	out, ok := w.(http.Flusher)
 	if !ok {
 		return nil, http.ErrNotSupported
@@ -71,22 +72,30 @@ func NewPusher(w http.ResponseWriter, timeout time.Duration) (Pusher, error) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	out.Flush()
+	out.Flush() // Flush the headers
+	engine := NewPushWriter(w, timeout)
 
-	p := &pusher{
-		w:   w,
-		out: out,
-	}
-
-	if timeout > 0 {
-		p.timeout = timeout
-		p.clearTimeout = setTimeout(p.timeout, p.ping)
-	}
-
-	return p, nil
+	return NewPushCloser(
+		func(msg *Message) error {
+			if err := engine.Push(msg); err != nil {
+				return err
+			}
+			out.Flush()
+			return nil
+		},
+		engine.Close,
+	), nil
 }
 
+//
+// Helpers
+//
+
 func setTimeout(delay time.Duration, fn func()) func() {
+	if delay <= 0 {
+		return func() {}
+	}
+
 	timer := time.NewTimer(delay)
 
 	// Create a cancel channel

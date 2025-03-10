@@ -1,4 +1,4 @@
-package exp
+package sse
 
 import (
 	"io"
@@ -12,6 +12,10 @@ type Message struct {
 	// private for keep track of Reader state
 	readerRemaining int
 	buffer          []byte
+}
+
+func (m *Message) String() string {
+	return "id: " + m.Id + ", event: " + m.Event + ", data: " + m.Data
 }
 
 func (m *Message) Read(b []byte) (int, error) {
@@ -54,76 +58,55 @@ func (m *Message) Read(b []byte) (int, error) {
 }
 
 func (m *Message) Write(b []byte) (int, error) {
-	lines := string(b)
-	currentField := ""
-	currentValue := ""
-
-	// Reset the event fields
 	m.Id = ""
 	m.Event = ""
 	m.Data = ""
 
-	for i := 0; i < len(lines); i++ {
-		// Check for line endings
-		if lines[i] == '\n' {
-			// Process the current line
-			if currentField != "" {
-				switch currentField {
-				case "id":
-					m.Id = currentValue
-				case "event":
-					m.Event = currentValue
-					// If ping event, reset all fields
-					if currentValue == "ping" {
-						m.Id = ""
-						m.Event = ""
-						m.Data = ""
-						return len(b), nil
-					}
-				case "data":
-					m.Data = currentValue
-				}
-				currentField = ""
-				currentValue = ""
-			}
-			continue
+	var i int
+	for i < len(b) {
+		// Find field name
+		start := i
+		for i < len(b) && b[i] != ':' && b[i] != '\n' {
+			i++
 		}
 
-		// Parse field name
-		if currentField == "" && i+1 < len(lines) && lines[i] != ':' {
-			j := i
-			for j < len(lines) && lines[j] != ':' && lines[j] != '\n' {
-				j++
-			}
-			if j < len(lines) && lines[j] == ':' {
-				currentField = lines[i:j]
-				i = j
-				// Skip the space after colon if present
-				if i+1 < len(lines) && lines[i+1] == ' ' {
-					i++
-				}
-			}
-		} else if currentField != "" {
-			// Append to current value
-			currentValue += string(lines[i])
+		if i >= len(b) || b[i] == '\n' {
+			i++
+			continue // Empty line or invalid format
 		}
-	}
 
-	// Process any remaining field
-	if currentField != "" {
-		switch currentField {
+		fieldName := string(b[start:i])
+		i++ // Skip the colon
+
+		// Skip the space after colon if present
+		if i < len(b) && b[i] == ' ' {
+			i++
+		}
+
+		// Find field value
+		start = i
+		for i < len(b) && b[i] != '\n' {
+			i++
+		}
+
+		value := string(b[start:i])
+		i++ // Skip the newline
+
+		// Process the field
+		switch fieldName {
 		case "id":
-			m.Id = currentValue
+			m.Id = value
 		case "event":
-			m.Event = currentValue
+			m.Event = value
 			// If ping event, reset all fields
-			if currentValue == "ping" {
+			if value == "ping" {
 				m.Id = ""
 				m.Event = ""
 				m.Data = ""
+				return len(b), nil
 			}
 		case "data":
-			m.Data = currentValue
+			m.Data = value
 		}
 	}
 

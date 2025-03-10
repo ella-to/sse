@@ -8,12 +8,10 @@ import (
 )
 
 type receiver struct {
-	ch    <-chan *Message
-	close func() error
+	ch <-chan *Message
 }
 
 var _ Receiver = &receiver{}
-var _ io.Closer = &receiver{}
 
 func (r *receiver) Receive(ctx context.Context) (*Message, error) {
 	select {
@@ -27,14 +25,9 @@ func (r *receiver) Receive(ctx context.Context) (*Message, error) {
 	}
 }
 
-func (r *receiver) Close() error {
-	return r.close()
-}
-
-func NewReceiver(rc io.ReadCloser) Receiver {
+func NewReceiver(rc io.Reader) Receiver {
 	return &receiver{
-		ch:    Parse(rc),
-		close: rc.Close,
+		ch: Parse(rc),
 	}
 }
 
@@ -106,11 +99,11 @@ func parseMessage(r io.Reader, buffer *bytes.Buffer) (*Message, error) {
 
 		switch field {
 		case "id":
-			msg.Id = &value
+			msg.Id = value
 		case "event":
 			msg.Event = value
 		case "data":
-			msg.Data = &value
+			msg.Data = value
 		}
 	}
 

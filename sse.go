@@ -1,73 +1,48 @@
 package sse
 
-import (
-	"context"
-	"strings"
-)
+import "context"
 
 const (
-	Version = "0.0.7"
+	Version = "0.0.8"
 )
+
+//
+// Pusher
+//
 
 type Pusher interface {
 	Push(msg *Message) error
-	Close()
+	Close() error
 }
+
+//
+// Receiver
+//
 
 type Receiver interface {
 	Receive(ctx context.Context) (*Message, error)
 }
 
-type StringWriter interface {
-	WriteString(string) (int, error)
+//
+// PushCloser
+//
+
+type pushCloser struct {
+	push  func(msg *Message) error
+	close func() error
 }
 
-type StringEncoder interface {
-	EncodeString(StringWriter)
+func (pc *pushCloser) Push(msg *Message) error {
+	return pc.push(msg)
 }
 
-type Message struct {
-	Id    *string
-	Event string
-	Data  *string
+func (pc *pushCloser) Close() error {
+	return pc.close()
 }
 
-var _ StringEncoder = (*Message)(nil)
-
-func (m *Message) EncodeString(sw StringWriter) {
-	if m.Id != nil {
-		sw.WriteString("id: ")
-		sw.WriteString(*m.Id)
-		sw.WriteString("\n")
+func NewPushCloser(push func(msg *Message) error, close func() error) Pusher {
+	return &pushCloser{
+		push:  push,
+		close: close,
 	}
-
-	if m.Event != "" {
-		sw.WriteString("event: ")
-		sw.WriteString(m.Event)
-		sw.WriteString("\n")
-	}
-
-	if m.Data != nil {
-		sw.WriteString("data: ")
-		sw.WriteString(*m.Data)
-		sw.WriteString("\n")
-	}
-
-	sw.WriteString("\n")
-}
-
-func (m *Message) String() string {
-	var sb strings.Builder
-
-	m.EncodeString(&sb)
-
-	return sb.String()
-}
-
-type Ping struct{}
-
-var _ StringEncoder = (*Ping)(nil)
-
-func (p *Ping) EncodeString(sw StringWriter) {
-	sw.WriteString(": ping\n\n")
 }
