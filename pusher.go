@@ -8,22 +8,24 @@ import (
 )
 
 //
-// PushWriter
+// rawPusher
 //
 
-type PushWriter struct {
+type rawPusher struct {
 	w            io.Writer
 	mtx          sync.Mutex
 	timeout      time.Duration
 	clearTimeout func()
 }
 
-func (p *PushWriter) Push(msg *Message) error {
+func (p *rawPusher) Push(msg *Message) error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
-	if p.clearTimeout != nil && p.timeout > 0 {
-		p.clearTimeout()
+	if p.timeout > 0 {
+		if p.clearTimeout != nil {
+			p.clearTimeout()
+		}
 		p.clearTimeout = setTimeout(p.timeout, p.ping)
 	}
 
@@ -35,7 +37,7 @@ func (p *PushWriter) Push(msg *Message) error {
 	return nil
 }
 
-func (p *PushWriter) Close() error {
+func (p *rawPusher) Close() error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
@@ -47,14 +49,16 @@ func (p *PushWriter) Close() error {
 	return nil
 }
 
-func (p *PushWriter) ping() {
+func (p *rawPusher) ping() {
 	p.Push(NewPingEvent())
 }
 
-func NewPushWriter(w io.Writer, timeout time.Duration) *PushWriter {
-	return &PushWriter{
-		w:       w,
-		timeout: timeout,
+func NewPusher(w io.Writer, timeout time.Duration) (Pusher, error) {
+	switch v := w.(type) {
+	case http.ResponseWriter:
+		return NewHttpPusher(v, timeout)
+	default:
+		return &rawPusher{w: w, timeout: timeout}, nil
 	}
 }
 
@@ -73,17 +77,18 @@ func NewHttpPusher(w http.ResponseWriter, timeout time.Duration) (Pusher, error)
 	w.Header().Set("Connection", "keep-alive")
 
 	out.Flush() // Flush the headers
-	engine := NewPushWriter(w, timeout)
+
+	raw := &rawPusher{w: w, timeout: timeout}
 
 	return NewPushCloser(
 		func(msg *Message) error {
-			if err := engine.Push(msg); err != nil {
+			if err := raw.Push(msg); err != nil {
 				return err
 			}
 			out.Flush()
 			return nil
 		},
-		engine.Close,
+		raw.Close,
 	), nil
 }
 

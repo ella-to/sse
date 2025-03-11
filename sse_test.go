@@ -45,6 +45,60 @@ func TestParseLarge(t *testing.T) {
 	}
 }
 
+func TestPushReceive(t *testing.T) {
+	n := 10
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pusher, err := sse.NewHttpPusher(w, 500*time.Millisecond)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer pusher.Close()
+
+		var msg sse.Message
+
+		for i := range n {
+			msg.Id = fmt.Sprintf("id-%d", i)
+			msg.Event = "event"
+			msg.Data = fmt.Sprintf("data-%d", i)
+
+			err = pusher.Push(&msg)
+			if err != nil {
+				break
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := http.Client{}
+
+	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	defer resp.Body.Close()
+
+	r := sse.NewReceiver(resp.Body)
+
+	for {
+		msg, err := r.Receive(context.Background())
+		if err != nil {
+			break
+		}
+
+		fmt.Println(msg)
+	}
+
+}
+
 func TestPusherReceiver(t *testing.T) {
 	n := 100000
 	c := 10
