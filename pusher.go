@@ -16,11 +16,16 @@ type rawPusher struct {
 	mtx          sync.Mutex
 	timeout      time.Duration
 	clearTimeout func()
+	closed       bool // Add closed flag
 }
 
 func (p *rawPusher) Push(msg *Message) error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
+
+	if p.closed { // Prevent push if closed
+		return io.ErrClosedPipe
+	}
 
 	if p.timeout > 0 {
 		if p.clearTimeout != nil {
@@ -41,6 +46,11 @@ func (p *rawPusher) Close() error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+
 	if p.clearTimeout != nil {
 		p.clearTimeout()
 		p.clearTimeout = nil
@@ -50,6 +60,12 @@ func (p *rawPusher) Close() error {
 }
 
 func (p *rawPusher) ping() {
+	p.mtx.Lock()
+	if p.closed {
+		p.mtx.Unlock()
+		return
+	}
+	p.mtx.Unlock()
 	p.Push(NewPingEvent())
 }
 
