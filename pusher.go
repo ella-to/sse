@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -12,61 +13,85 @@ import (
 //
 
 type rawPusher struct {
-	w            io.Writer
-	mtx          sync.Mutex
-	timeout      time.Duration
-	clearTimeout func()
-	closed       bool // Add closed flag
+	w       io.Writer
+	mtx     sync.RWMutex // Use RWMutex for better read performance
+	timeout time.Duration
+	timer   *time.Timer
+	closed  int32 // Use atomic for lock-free reads
 }
 
 func (p *rawPusher) Push(msg *Message) error {
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
-
-	if p.closed { // Prevent push if closed
+	// Fast path: check if closed without lock
+	if atomic.LoadInt32(&p.closed) == 1 {
 		return io.ErrClosedPipe
 	}
 
-	if p.timeout > 0 {
-		if p.clearTimeout != nil {
-			p.clearTimeout()
-		}
-		p.clearTimeout = setTimeout(p.timeout, p.ping)
-	}
-
-	_, err := io.Copy(p.w, msg)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (p *rawPusher) Close() error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
-	if p.closed {
-		return nil
+	// Double-check after acquiring lock
+	if atomic.LoadInt32(&p.closed) == 1 {
+		return io.ErrClosedPipe
 	}
-	p.closed = true
 
-	if p.clearTimeout != nil {
-		p.clearTimeout()
-		p.clearTimeout = nil
+	// Manage timer more efficiently
+	if p.timeout > 0 {
+		if p.timer == nil {
+			p.timer = time.NewTimer(p.timeout)
+			go p.timerHandler()
+		} else {
+			p.timer.Reset(p.timeout)
+		}
+	}
+
+	_, err := io.Copy(p.w, msg)
+	return err
+}
+
+func (p *rawPusher) Close() error {
+	// Use atomic to prevent double-close
+	if !atomic.CompareAndSwapInt32(&p.closed, 0, 1) {
+		return nil // Already closed
+	}
+
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+
+	if p.timer != nil {
+		p.timer.Stop()
+		p.timer = nil
 	}
 
 	return nil
 }
 
-func (p *rawPusher) ping() {
-	p.mtx.Lock()
-	if p.closed {
-		p.mtx.Unlock()
-		return
+// timerHandler manages the ping timer in a single goroutine
+func (p *rawPusher) timerHandler() {
+	for {
+		select {
+		case <-p.timer.C:
+			if atomic.LoadInt32(&p.closed) == 1 {
+				return
+			}
+			// Send ping without recursion
+			p.sendPing()
+		}
+
+		// Check if we should exit
+		if atomic.LoadInt32(&p.closed) == 1 {
+			return
+		}
 	}
-	p.mtx.Unlock()
-	p.Push(NewPingEvent())
+}
+
+func (p *rawPusher) sendPing() {
+	p.mtx.RLock()
+	closed := atomic.LoadInt32(&p.closed) == 1
+	p.mtx.RUnlock()
+
+	if !closed {
+		p.Push(NewPingEvent())
+	}
 }
 
 func NewPusher(w io.Writer, timeout time.Duration) (Pusher, error) {
@@ -91,6 +116,8 @@ func NewHttpPusher(w http.ResponseWriter, timeout time.Duration) (Pusher, error)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // Add CORS support
+	w.Header().Set("Access-Control-Allow-Headers", "Cache-Control")
 
 	out.Flush() // Flush the headers
 
@@ -106,35 +133,4 @@ func NewHttpPusher(w http.ResponseWriter, timeout time.Duration) (Pusher, error)
 		},
 		raw.Close,
 	), nil
-}
-
-//
-// Helpers
-//
-
-func setTimeout(delay time.Duration, fn func()) func() {
-	if delay <= 0 {
-		return func() {}
-	}
-
-	timer := time.NewTimer(delay)
-
-	// Create a cancel channel
-	cancel := make(chan struct{})
-
-	go func() {
-		select {
-		case <-timer.C:
-			// Timer expired, execute the function
-			fn()
-		case <-cancel:
-			// Timer was canceled
-			timer.Stop()
-		}
-	}()
-
-	// Return the cancel function
-	return func() {
-		close(cancel)
-	}
 }

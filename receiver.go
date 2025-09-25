@@ -1,10 +1,11 @@
 package sse
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"errors"
 	"io"
+	"strings"
 )
 
 type receiver struct {
@@ -32,22 +33,33 @@ func NewReceiver(rc io.Reader) Receiver {
 }
 
 func Parse(r io.Reader) <-chan *Message {
-	ch := make(chan *Message)
-	var buffer bytes.Buffer
+	ch := make(chan *Message, 16) // Buffered channel for better throughput
+	scanner := bufio.NewScanner(r)
+
+	// Use a larger buffer to reduce system calls
+	buf := make([]byte, 0, 4096)
+	scanner.Buffer(buf, 65536) // 64KB max token size
 
 	go func() {
 		defer close(ch)
-		for {
-			msg, err := parseMessage(r, &buffer)
-			done := errors.Is(err, io.EOF)
 
-			if err != nil && !done {
+		for {
+			msg, err := parseMessageOptimized(scanner)
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					// Log error if needed
+				}
 				return
+			}
+
+			// Skip empty messages
+			if msg.Id == "" && msg.Event == "" && msg.Data == "" {
+				continue
 			}
 
 			ch <- msg
 
-			if done || msg.Event == "done" {
+			if msg.Event == "done" {
 				return
 			}
 		}
@@ -56,76 +68,47 @@ func Parse(r io.Reader) <-chan *Message {
 	return ch
 }
 
-func parseMessage(r io.Reader, buffer *bytes.Buffer) (*Message, error) {
+// parseMessageOptimized uses bufio.Scanner for efficient line reading
+func parseMessageOptimized(scanner *bufio.Scanner) (*Message, error) {
 	msg := &Message{}
 
-	lastMsgWasComment := false
+	for scanner.Scan() {
+		line := scanner.Text()
 
-	for {
-		buffer.Reset()
-
-		err := readLine(r, buffer)
-		if err != nil {
-			return msg, err
-		}
-
-		line := buffer.Bytes()
-
-		if len(line) == 0 {
-			if lastMsgWasComment {
-				lastMsgWasComment = false
-				continue
-			}
+		// Empty line indicates end of message
+		if line == "" {
 			break
 		}
 
-		// it means that the line is a comment
-		// and we can ignore it
-		if line[0] == ':' {
-			lastMsgWasComment = true
+		// Comment line (starts with :)
+		if strings.HasPrefix(line, ":") {
 			continue
 		}
 
-		index := bytes.Index(line, []byte(": "))
-		if index == -1 {
-			// this shouldn't happen, but if it does
-			// it means that the line is invalid
-			// and we can ignore it
-			continue
-		}
+		// Parse field: value pairs
+		if colonIndex := strings.Index(line, ": "); colonIndex != -1 {
+			field := line[:colonIndex]
+			value := line[colonIndex+2:]
 
-		field := string(line[:index])
-		value := string(line[index+2:])
-
-		switch field {
-		case "id":
-			msg.Id = value
-		case "event":
-			msg.Event = value
-		case "data":
-			msg.Data = value
+			switch field {
+			case "id":
+				msg.Id = value
+			case "event":
+				msg.Event = value
+			case "data":
+				msg.Data = value
+			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	// If we got here without any fields, check if scanner is done
+	if msg.Id == "" && msg.Event == "" && msg.Data == "" {
+		return nil, io.EOF
 	}
 
 	return msg, nil
-}
-
-// fill the buffer with the content of the line
-// until a newline character is found, it will eat the newline
-// but it will not be part of the buffer
-func readLine(r io.Reader, buffer *bytes.Buffer) error {
-	b := make([]byte, 1)
-
-	for {
-		_, err := r.Read(b)
-		if err != nil {
-			return err
-		}
-
-		if b[0] == '\n' {
-			return nil
-		}
-
-		buffer.Write(b)
-	}
 }
