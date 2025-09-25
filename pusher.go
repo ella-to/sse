@@ -68,18 +68,20 @@ func (p *rawPusher) Close() error {
 // timerHandler manages the ping timer in a single goroutine
 func (p *rawPusher) timerHandler() {
 	for {
-		select {
-		case <-p.timer.C:
-			if atomic.LoadInt32(&p.closed) == 1 {
-				return
-			}
-			// Send ping without recursion
-			p.sendPing()
-		}
+		// Wait for timer to fire
+		<-p.timer.C
 
-		// Check if we should exit
+		// Check if we should exit after timer fires
 		if atomic.LoadInt32(&p.closed) == 1 {
 			return
+		}
+
+		// Send ping without recursion
+		p.sendPing()
+
+		// Reset timer for next ping
+		if p.timeout > 0 && atomic.LoadInt32(&p.closed) == 0 {
+			p.timer.Reset(p.timeout)
 		}
 	}
 }

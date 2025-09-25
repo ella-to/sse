@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,7 +108,7 @@ func TestPushReceive(t *testing.T) {
 		defer pusher.Close()
 
 		for i := range n {
-			msg := sse.NewMessage(fmt.Sprintf("id-%d", i), "event", fmt.Sprintf("data-%d", i))
+			msg := sse.NewMessage("id_"+strconv.Itoa(i), "event", "data_"+strconv.Itoa(i))
 			err = pusher.Push(msg)
 			if err != nil {
 				break
@@ -168,7 +169,7 @@ func TestPusherReceiver(t *testing.T) {
 		defer pusher.Close()
 
 		for i := range n {
-			msg := sse.NewMessage(fmt.Sprintf("id-%d", i), "event", fmt.Sprintf("data-%d", i))
+			msg := sse.NewMessage("id_"+strconv.Itoa(i), "event", "data_"+strconv.Itoa(i))
 			err = pusher.Push(msg)
 			if err != nil {
 				break
@@ -234,7 +235,7 @@ func BenchmarkPushReceive(b *testing.B) {
 		defer pusher.Close()
 
 		for i := 0; i < b.N; i++ {
-			msg := sse.NewMessage(fmt.Sprintf("id-%d", i), "benchmark", fmt.Sprintf("data-%d", i))
+			msg := sse.NewMessage("id_"+strconv.Itoa(i), "benchmark", "data_"+strconv.Itoa(i))
 			if err := pusher.Push(msg); err != nil {
 				break
 			}
@@ -313,7 +314,7 @@ func BenchmarkHighThroughput(b *testing.B) {
 		defer pusher.Close()
 
 		for i := 0; i < numMessages; i++ {
-			msg := sse.NewMessage(fmt.Sprintf("id-%d", i), "throughput", fmt.Sprintf("data-%d", i))
+			msg := sse.NewMessage("id_"+strconv.Itoa(i), "throughput", "data_"+strconv.Itoa(i))
 			if err := pusher.Push(msg); err != nil {
 				break
 			}

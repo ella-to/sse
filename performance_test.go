@@ -177,7 +177,37 @@ func BenchmarkParsingEfficiency(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				r := strings.NewReader(tc.data)
 				ch := sse.Parse(r)
-				<-ch
+				msg := <-ch
+				// Return message to pool to be fair
+				sse.PutMessage(msg)
+			}
+		})
+	}
+}
+
+// Benchmark the new optimized parser
+func BenchmarkOptimizedParsing(b *testing.B) {
+	testCases := []struct {
+		name string
+		data string
+	}{
+		{"Tiny", "id: 1\ndata: x\n\n"},
+		{"Small", "id: 12345\nevent: test\ndata: " + strings.Repeat("x", 50) + "\n\n"},
+		{"Medium", "id: 12345\nevent: test\ndata: " + strings.Repeat("x", 500) + "\n\n"},
+		{"Large", "id: 12345\nevent: test\ndata: " + strings.Repeat("x", 2000) + "\n\n"},
+	}
+
+	for _, tc := range testCases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				r := strings.NewReader(tc.data)
+				ch := sse.FastParse(r)
+				msg := <-ch
+				// Return message to pool
+				sse.PutMessage(msg)
 			}
 		})
 	}

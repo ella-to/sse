@@ -13,6 +13,13 @@ var bufferPool = sync.Pool{
 	},
 }
 
+// Message pool to reuse Message objects and reduce GC pressure
+var messagePool = sync.Pool{
+	New: func() interface{} {
+		return &Message{}
+	},
+}
+
 // getBuffer gets a buffer from the pool
 func getBuffer() []byte {
 	return (*bufferPool.Get().(*[]byte))[:0] // Reset length to 0
@@ -22,6 +29,19 @@ func getBuffer() []byte {
 func putBuffer(buf []byte) {
 	if cap(buf) <= 4096 { // Only pool buffers up to 4KB to prevent memory bloat
 		bufferPool.Put(&buf)
+	}
+}
+
+// GetMessage gets a message from the pool
+func GetMessage() *Message {
+	return messagePool.Get().(*Message)
+}
+
+// PutMessage returns a message to the pool after resetting it
+func PutMessage(msg *Message) {
+	if msg != nil {
+		msg.Reset()
+		messagePool.Put(msg)
 	}
 }
 
@@ -166,7 +186,7 @@ func (m *Message) Write(b []byte) (int, error) {
 			continue // Empty line or invalid format
 		}
 
-		fieldName := string(b[start:i])
+		fieldBytes := b[start:i]
 		i++ // Skip the colon
 
 		// Skip the space after colon if present
@@ -180,24 +200,26 @@ func (m *Message) Write(b []byte) (int, error) {
 			i++
 		}
 
-		value := string(b[start:i])
+		valueBytes := b[start:i]
 		i++ // Skip the newline
 
-		// Process the field
-		switch fieldName {
-		case "id":
-			m.Id = value
-		case "event":
-			m.Event = value
+		// Process the field using byte comparison to avoid string allocations
+		if len(fieldBytes) == 2 && fieldBytes[0] == 'i' && fieldBytes[1] == 'd' {
+			m.Id = string(valueBytes)
+		} else if len(fieldBytes) == 5 && fieldBytes[0] == 'e' && fieldBytes[1] == 'v' &&
+			fieldBytes[2] == 'e' && fieldBytes[3] == 'n' && fieldBytes[4] == 't' {
+			m.Event = string(valueBytes)
 			// If ping event, reset all fields
-			if value == "ping" {
+			if len(valueBytes) == 4 && valueBytes[0] == 'p' && valueBytes[1] == 'i' &&
+				valueBytes[2] == 'n' && valueBytes[3] == 'g' {
 				m.Id = ""
 				m.Event = ""
 				m.Data = ""
 				return len(b), nil
 			}
-		case "data":
-			m.Data = value
+		} else if len(fieldBytes) == 4 && fieldBytes[0] == 'd' && fieldBytes[1] == 'a' &&
+			fieldBytes[2] == 't' && fieldBytes[3] == 'a' {
+			m.Data = string(valueBytes)
 		}
 	}
 
@@ -205,13 +227,13 @@ func (m *Message) Write(b []byte) (int, error) {
 }
 
 func NewMessage(id, event, data string) *Message {
-	return &Message{
-		Id:    id,
-		Event: event,
-		Data:  data,
-	}
+	msg := GetMessage()
+	msg.Id = id
+	msg.Event = event
+	msg.Data = data
+	return msg
 }
 
 func NewPingEvent() *Message {
-	return &Message{}
+	return GetMessage() // Already reset by GetMessage
 }
