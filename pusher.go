@@ -18,6 +18,7 @@ type rawPusher struct {
 	timeout time.Duration
 	timer   *time.Timer
 	closed  int32 // Use atomic for lock-free reads
+	done    chan struct{}
 }
 
 func (p *rawPusher) Push(msg *Message) error {
@@ -55,12 +56,11 @@ func (p *rawPusher) Close() error {
 	}
 
 	p.mtx.Lock()
-	defer p.mtx.Unlock()
-
 	if p.timer != nil {
 		p.timer.Stop()
-		p.timer = nil
 	}
+	close(p.done) // Signal goroutine to stop
+	p.mtx.Unlock()
 
 	return nil
 }
@@ -68,20 +68,23 @@ func (p *rawPusher) Close() error {
 // timerHandler manages the ping timer in a single goroutine
 func (p *rawPusher) timerHandler() {
 	for {
-		// Wait for timer to fire
-		<-p.timer.C
+		select {
+		case <-p.timer.C:
+			// Check if we should exit after timer fires
+			if atomic.LoadInt32(&p.closed) == 1 {
+				return
+			}
 
-		// Check if we should exit after timer fires
-		if atomic.LoadInt32(&p.closed) == 1 {
+			// Send ping without recursion
+			p.sendPing()
+
+			// Reset timer for next ping
+			if p.timeout > 0 && atomic.LoadInt32(&p.closed) == 0 {
+				p.timer.Reset(p.timeout)
+			}
+		case <-p.done:
+			// Exit when Close() is called
 			return
-		}
-
-		// Send ping without recursion
-		p.sendPing()
-
-		// Reset timer for next ping
-		if p.timeout > 0 && atomic.LoadInt32(&p.closed) == 0 {
-			p.timer.Reset(p.timeout)
 		}
 	}
 }
@@ -101,7 +104,7 @@ func NewPusher(w io.Writer, timeout time.Duration) (Pusher, error) {
 	case http.ResponseWriter:
 		return NewHttpPusher(v, timeout)
 	default:
-		return &rawPusher{w: w, timeout: timeout}, nil
+		return &rawPusher{w: w, timeout: timeout, done: make(chan struct{})}, nil
 	}
 }
 
@@ -123,7 +126,7 @@ func NewHttpPusher(w http.ResponseWriter, timeout time.Duration) (Pusher, error)
 
 	out.Flush() // Flush the headers
 
-	raw := &rawPusher{w: w, timeout: timeout}
+	raw := &rawPusher{w: w, timeout: timeout, done: make(chan struct{})}
 
 	return NewPushCloser(
 		func(msg *Message) error {
