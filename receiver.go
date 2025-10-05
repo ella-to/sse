@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"time"
 )
 
 type receiver struct {
@@ -137,28 +139,59 @@ type httpReceiver struct {
 	client    *http.Client
 	receiver  Receiver
 	connected bool
+	// Connection retry configuration
+	maxConnectionRetries int
+	initialRetryDelay    time.Duration
+	maxRetryDelay        time.Duration
 }
 
 var _ Receiver = (*httpReceiver)(nil)
 
 func (hr *httpReceiver) Receive(ctx context.Context) (*Message, error) {
-	// If not connected or receiver is nil, establish connection
-	if !hr.connected || hr.receiver == nil {
-		if err := hr.connect(ctx); err != nil {
-			return nil, err
+	// Retry connection establishment if needed
+	for attempt := 0; attempt <= hr.maxConnectionRetries; attempt++ {
+		// If not connected or receiver is nil, establish connection
+		if !hr.connected || hr.receiver == nil {
+			if err := hr.connect(ctx); err != nil {
+				// If this is the last attempt, return the error
+				if attempt == hr.maxConnectionRetries {
+					return nil, fmt.Errorf("failed to establish connection after %d attempts: %w", hr.maxConnectionRetries+1, err)
+				}
+
+				// Calculate backoff delay
+				delay := hr.calculateConnectionBackoff(attempt)
+
+				// Wait with context cancellation support
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(delay):
+					continue // Try again
+				}
+			}
 		}
+
+		// Try to receive a message
+		msg, err := hr.receiver.Receive(ctx)
+		if err != nil {
+			// Connection lost, reset state
+			hr.connected = false
+			hr.receiver = nil
+
+			// If this is the last attempt, return the error
+			if attempt == hr.maxConnectionRetries {
+				return nil, fmt.Errorf("failed to receive message after %d connection attempts: %w", hr.maxConnectionRetries+1, err)
+			}
+
+			// Continue to retry connection
+			continue
+		}
+
+		return msg, nil
 	}
 
-	// Try to receive a message
-	msg, err := hr.receiver.Receive(ctx)
-	if err != nil {
-		// Connection lost, reset state
-		hr.connected = false
-		hr.receiver = nil
-		return nil, err
-	}
-
-	return msg, nil
+	// This should never be reached due to the loop structure
+	return nil, fmt.Errorf("unexpected error in connection retry logic")
 }
 
 func (hr *httpReceiver) connect(ctx context.Context) error {
@@ -188,8 +221,65 @@ func (hr *httpReceiver) connect(ctx context.Context) error {
 	return nil
 }
 
-func NewHttpReceiver(url string, opts ...retryTransportOpt) (*httpReceiver, error) {
-	client, err := NewRetryClient(opts...)
+// calculateConnectionBackoff calculates exponential backoff with max delay for connection retries
+func (hr *httpReceiver) calculateConnectionBackoff(attempt int) time.Duration {
+	delay := time.Duration(float64(hr.initialRetryDelay) * math.Pow(2, float64(attempt)))
+	if delay > hr.maxRetryDelay {
+		delay = hr.maxRetryDelay
+	}
+	return delay
+}
+
+// Connection retry options for httpReceiver
+type httpReceiverOpt func(*httpReceiver) error
+
+func WithConnectionMaxRetries(maxRetries int) httpReceiverOpt {
+	return func(hr *httpReceiver) error {
+		if maxRetries < 0 {
+			return fmt.Errorf("maxRetries must be non-negative")
+		}
+		hr.maxConnectionRetries = maxRetries
+		return nil
+	}
+}
+
+func WithConnectionInitialDelay(delay time.Duration) httpReceiverOpt {
+	return func(hr *httpReceiver) error {
+		if delay <= 0 {
+			return fmt.Errorf("initial delay must be positive")
+		}
+		hr.initialRetryDelay = delay
+		return nil
+	}
+}
+
+func WithConnectionMaxDelay(delay time.Duration) httpReceiverOpt {
+	return func(hr *httpReceiver) error {
+		if delay <= 0 {
+			return fmt.Errorf("max delay must be positive")
+		}
+		hr.maxRetryDelay = delay
+		return nil
+	}
+}
+
+func NewHttpReceiver(url string, opts ...interface{}) (*httpReceiver, error) {
+	// Separate retry transport options from connection retry options
+	var retryTransportOpts []retryTransportOpt
+	var httpReceiverOpts []httpReceiverOpt
+
+	for _, opt := range opts {
+		switch o := opt.(type) {
+		case retryTransportOpt:
+			retryTransportOpts = append(retryTransportOpts, o)
+		case httpReceiverOpt:
+			httpReceiverOpts = append(httpReceiverOpts, o)
+		default:
+			return nil, fmt.Errorf("unsupported option type: %T", opt)
+		}
+	}
+
+	client, err := NewRetryClient(retryTransportOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -197,6 +287,17 @@ func NewHttpReceiver(url string, opts ...retryTransportOpt) (*httpReceiver, erro
 	hr := &httpReceiver{
 		url:    url,
 		client: client,
+		// Default connection retry configuration
+		maxConnectionRetries: 3,
+		initialRetryDelay:    500 * time.Millisecond,
+		maxRetryDelay:        30 * time.Second,
+	}
+
+	// Apply connection retry options
+	for _, opt := range httpReceiverOpts {
+		if err := opt(hr); err != nil {
+			return nil, err
+		}
 	}
 
 	return hr, nil

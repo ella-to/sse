@@ -97,7 +97,14 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if attempt < t.MaxRetries {
 			delay := t.calculateBackoff(attempt)
 			fmt.Printf("Attempt %d failed, retrying in %v...\n", attempt+1, delay)
-			time.Sleep(delay)
+
+			// Use context-aware sleep to respect cancellation
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(delay):
+				// Continue to next retry
+			}
 		}
 	}
 
