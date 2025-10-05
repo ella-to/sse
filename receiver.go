@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 )
 
 type receiver struct {
@@ -124,4 +126,78 @@ func parseMessageOptimized(scanner *bufio.Scanner) (*Message, error) {
 	}
 
 	return msg, nil
+}
+
+//
+// httpReceiver
+//
+
+type httpReceiver struct {
+	url       string
+	client    *http.Client
+	receiver  Receiver
+	connected bool
+}
+
+var _ Receiver = (*httpReceiver)(nil)
+
+func (hr *httpReceiver) Receive(ctx context.Context) (*Message, error) {
+	// If not connected or receiver is nil, establish connection
+	if !hr.connected || hr.receiver == nil {
+		if err := hr.connect(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	// Try to receive a message
+	msg, err := hr.receiver.Receive(ctx)
+	if err != nil {
+		// Connection lost, reset state
+		hr.connected = false
+		hr.receiver = nil
+		return nil, err
+	}
+
+	return msg, nil
+}
+
+func (hr *httpReceiver) connect(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", hr.url, nil)
+	if err != nil {
+		return err
+	}
+
+	// Set SSE headers
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	resp, err := hr.client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	// Check if response is valid
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	// Create receiver from response body
+	hr.receiver = NewReceiver(resp.Body)
+	hr.connected = true
+	return nil
+}
+
+func NewHttpReceiver(url string, opts ...retryTransportOpt) (*httpReceiver, error) {
+	client, err := NewRetryClient(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	hr := &httpReceiver{
+		url:    url,
+		client: client,
+	}
+
+	return hr, nil
 }
