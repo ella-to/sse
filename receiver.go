@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -143,6 +144,8 @@ type httpReceiver struct {
 	maxConnectionRetries int
 	initialRetryDelay    time.Duration
 	maxRetryDelay        time.Duration
+	// Mutex to protect concurrent access to receiver and connected fields
+	mu sync.RWMutex
 }
 
 var _ Receiver = (*httpReceiver)(nil)
@@ -150,8 +153,14 @@ var _ Receiver = (*httpReceiver)(nil)
 func (hr *httpReceiver) Receive(ctx context.Context) (*Message, error) {
 	// Retry connection establishment if needed
 	for attempt := 0; attempt <= hr.maxConnectionRetries; attempt++ {
+		// Check connection status with read lock
+		hr.mu.RLock()
+		connected := hr.connected
+		receiver := hr.receiver
+		hr.mu.RUnlock()
+
 		// If not connected or receiver is nil, establish connection
-		if !hr.connected || hr.receiver == nil {
+		if !connected || receiver == nil {
 			if err := hr.connect(ctx); err != nil {
 				// If this is the last attempt, return the error
 				if attempt == hr.maxConnectionRetries {
@@ -169,14 +178,20 @@ func (hr *httpReceiver) Receive(ctx context.Context) (*Message, error) {
 					continue // Try again
 				}
 			}
+			// Re-read receiver after successful connection
+			hr.mu.RLock()
+			receiver = hr.receiver
+			hr.mu.RUnlock()
 		}
 
 		// Try to receive a message
-		msg, err := hr.receiver.Receive(ctx)
+		msg, err := receiver.Receive(ctx)
 		if err != nil {
-			// Connection lost, reset state
+			// Connection lost, reset state with write lock
+			hr.mu.Lock()
 			hr.connected = false
 			hr.receiver = nil
+			hr.mu.Unlock()
 
 			// If this is the last attempt, return the error
 			if attempt == hr.maxConnectionRetries {
@@ -215,9 +230,12 @@ func (hr *httpReceiver) connect(ctx context.Context) error {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// Create receiver from response body
+	// Create receiver from response body and update state with write lock
+	hr.mu.Lock()
 	hr.receiver = NewReceiver(resp.Body)
 	hr.connected = true
+	hr.mu.Unlock()
+
 	return nil
 }
 
