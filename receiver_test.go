@@ -794,3 +794,52 @@ func TestHttpReceiver_MixedRetryOptions(t *testing.T) {
 	// Note: In this test, connection attempts equal HTTP attempts since each HTTP failure
 	// triggers a connection retry in our current implementation
 }
+
+func TestParseComment(t *testing.T) {
+	data := `: this is a comment
+
+id: 1
+event: test
+data: message with comment`
+
+	msgsCh := Parse(strings.NewReader(data))
+
+	msg, ok := <-msgsCh
+	if !ok {
+		t.Fatal("Expected a message, got channel closed")
+	}
+
+	if msg.Id != "1" || msg.Event != "test" || msg.Data != "message with comment" {
+		t.Errorf("Message mismatch: %+v", msg)
+	}
+}
+
+func TestParseCommentStream(t *testing.T) {
+	pr, pw := io.Pipe()
+
+	msgsCh := Parse(pr)
+
+	go func() {
+		defer pw.Close()
+		fmt.Fprint(pw, `: this is a comment`+"\n\n")
+		fmt.Fprint(pw, `: this is a comment`+"\n\n")
+		fmt.Fprint(pw, `: this is a comment`+"\n\n")
+		fmt.Fprint(pw, `: this is a comment`+"\n\n")
+		fmt.Fprint(pw, `: this is a comment`+"\n\n")
+
+		time.Sleep(1 * time.Second)
+
+		fmt.Fprint(pw, `id: 1
+event: test
+data: message with comment`+"\n\n")
+	}()
+
+	msg, ok := <-msgsCh
+	if !ok {
+		t.Fatal("Expected a message, got channel closed")
+	}
+
+	if msg.Id != "1" || msg.Event != "test" || msg.Data != "message with comment" {
+		t.Errorf("Message mismatch: %+v", msg)
+	}
+}

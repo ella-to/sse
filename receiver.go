@@ -77,16 +77,23 @@ func Parse(r io.Reader) <-chan *Message {
 func parseMessageOptimized(scanner *bufio.Scanner) (*Message, error) {
 	msg := GetMessage() // Use pooled message
 
+	isComment := false
+
 	for scanner.Scan() {
 		line := scanner.Bytes() // Use Bytes() instead of Text() to avoid string allocation
 
 		// Empty line indicates end of message
 		if len(line) == 0 {
+			if isComment {
+				isComment = false
+				continue
+			}
 			break
 		}
 
 		// Comment line (starts with :)
 		if len(line) > 0 && line[0] == ':' {
+			isComment = true
 			continue
 		}
 
