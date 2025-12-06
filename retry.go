@@ -61,6 +61,8 @@ func WithHeaders(headers map[string]string) retryTransportOpt {
 
 // RoundTrip implements the http.RoundTripper interface
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+
 	// Inject headers into every request
 	for k, v := range t.Headers {
 		req.Header.Set(k, v)
@@ -96,7 +98,8 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// Don't sleep after the last attempt
 		if attempt < t.MaxRetries {
 			delay := t.calculateBackoff(attempt)
-			fmt.Printf("Attempt %d failed, retrying in %v...\n", attempt+1, delay)
+
+			logger.DebugContext(ctx, "request failed, retrying", "attempt", attempt+1, "delay", delay)
 
 			// Use context-aware sleep to respect cancellation
 			select {

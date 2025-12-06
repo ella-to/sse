@@ -1,6 +1,9 @@
 package sse
 
-import "context"
+import (
+	"context"
+	"log/slog"
+)
 
 const (
 	Version = "0.1.2"
@@ -45,4 +48,10 @@ func NewPushCloser(push func(msg *Message) error, close func() error) Pusher {
 		push:  push,
 		close: close,
 	}
+}
+
+var logger = slog.Default()
+
+func SetLogger(l *slog.Logger) {
+	logger = l
 }
