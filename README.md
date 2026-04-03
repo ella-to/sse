@@ -1,6 +1,22 @@
-# sse
+```
+░██████╗░██████╗███████╗
+██╔════╝██╔════╝██╔════╝
+╚█████╗░╚█████╗░█████╗░░
+░╚═══██╗░╚═══██╗██╔══╝░░
+██████╔╝██████╔╝███████╗
+╚═════╝░╚═════╝░╚══════╝
+```
 
-Small SSE helper library for Go.
+<div align="center">
+
+[![Go Reference](https://pkg.go.dev/badge/ella.to/sse.svg)](https://pkg.go.dev/ella.to/sse)
+[![Go Report Card](https://goreportcard.com/badge/ella.to/sse)](https://goreportcard.com/report/ella.to/sse)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+
+_A simple, optimized, and high-performance Server-Sent Events (SSE) client and server library for Go._
+
+</div>
 
 This package gives you:
 
