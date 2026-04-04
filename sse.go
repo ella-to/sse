@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+var LibVersion = "0.2.1"
+
 type Message struct {
 	Id    string
 	Event string
