@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -388,6 +389,115 @@ func TestHttpPusherCloseClosesUnderlyingWriter(t *testing.T) {
 	}
 }
 
+type recordingResponseWriter struct {
+	mux      sync.Mutex
+	header   http.Header
+	buf      bytes.Buffer
+	writes   int
+	writeErr error
+}
+
+func (w *recordingResponseWriter) Header() http.Header {
+	w.mux.Lock()
+	defer w.mux.Unlock()
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *recordingResponseWriter) Write(b []byte) (int, error) {
+	w.mux.Lock()
+	defer w.mux.Unlock()
+	w.writes++
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.buf.Write(b)
+}
+
+func (w *recordingResponseWriter) WriteHeader(statusCode int) {}
+
+func (w *recordingResponseWriter) Flush() {}
+
+func (w *recordingResponseWriter) snapshot() (string, int) {
+	w.mux.Lock()
+	defer w.mux.Unlock()
+	return w.buf.String(), w.writes
+}
+
+func TestHttpPusherPingFiresWithoutPush(t *testing.T) {
+	t.Parallel()
+
+	w := &recordingResponseWriter{}
+	pusher, err := CreateHttpPusher(w, WithHttpPusherPingDuration(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("CreateHttpPusher() error = %v", err)
+	}
+	defer pusher.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		out, _ := w.snapshot()
+		if strings.Contains(out, ": ping\n\n") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ping was never written without an initial Push, got %q", out)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestHttpPusherPingStopsAfterClose(t *testing.T) {
+	t.Parallel()
+
+	w := &recordingResponseWriter{}
+	pusher, err := CreateHttpPusher(w, WithHttpPusherPingDuration(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("CreateHttpPusher() error = %v", err)
+	}
+
+	if err := pusher.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	_, before := w.snapshot()
+	time.Sleep(50 * time.Millisecond)
+	_, after := w.snapshot()
+	if after != before {
+		t.Fatalf("pings kept firing after Close(): writes %d -> %d", before, after)
+	}
+}
+
+func TestHttpPusherPingStopsAfterWriteError(t *testing.T) {
+	t.Parallel()
+
+	w := &recordingResponseWriter{writeErr: io.ErrClosedPipe}
+	pusher, err := CreateHttpPusher(w, WithHttpPusherPingDuration(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("CreateHttpPusher() error = %v", err)
+	}
+	defer pusher.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, writes := w.snapshot(); writes >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first ping never attempted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if _, writes := w.snapshot(); writes > 1 {
+		t.Fatalf("ping chain kept re-arming after write error: %d write attempts", writes)
+	}
+}
+
 func TestHttpReceiverCloseClosesUnderlyingBody(t *testing.T) {
 	t.Parallel()
 
@@ -620,6 +730,32 @@ func BenchmarkReadMessageSmall(b *testing.B) {
 	}
 }
 
+func BenchmarkReadMessageMultilineData(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString("id: 7\nevent: multi\n")
+	for i := range 10 {
+		sb.WriteString("data: line number ")
+		sb.WriteString(strconv.Itoa(i))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+	input := sb.String()
+
+	br := bufio.NewReaderSize(strings.NewReader(""), 4096)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+
+	for b.Loop() {
+		br.Reset(strings.NewReader(input))
+		msg, err := ReadMessage(br)
+		if err != nil {
+			b.Fatalf("ReadMessage() error = %v", err)
+		}
+		benchReadSink = msg
+	}
+}
+
 func BenchmarkReadMessageLargeData(b *testing.B) {
 	payload := strings.Repeat("a", 64*1024)
 	input := "id: 1\nevent: bulk\ndata: " + payload + "\n\n"
@@ -671,6 +807,61 @@ func BenchmarkWriteMessageLargeData(b *testing.B) {
 			b.Fatalf("WriteMessage() error = %v", err)
 		}
 		benchWriteSink += out.Len()
+	}
+}
+
+type discardResponseWriter struct {
+	header http.Header
+}
+
+func (w *discardResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+
+func (w *discardResponseWriter) WriteHeader(statusCode int) {}
+
+func (w *discardResponseWriter) Flush() {}
+
+func BenchmarkHttpPusherPush(b *testing.B) {
+	pusher, err := CreateHttpPusher(&discardResponseWriter{})
+	if err != nil {
+		b.Fatalf("CreateHttpPusher() error = %v", err)
+	}
+	defer pusher.Close()
+
+	msg := &Message{Id: "42", Event: "tick", Data: "hello world"}
+	b.ReportAllocs()
+	b.SetBytes(int64(len("id: 42\nevent: tick\ndata: hello world\n\n")))
+	b.ResetTimer()
+
+	for b.Loop() {
+		if err := pusher.Push(msg); err != nil {
+			b.Fatalf("Push() error = %v", err)
+		}
+	}
+}
+
+func BenchmarkHttpPusherPushWithPing(b *testing.B) {
+	pusher, err := CreateHttpPusher(&discardResponseWriter{}, WithHttpPusherPingDuration(time.Hour))
+	if err != nil {
+		b.Fatalf("CreateHttpPusher() error = %v", err)
+	}
+	defer pusher.Close()
+
+	msg := &Message{Id: "42", Event: "tick", Data: "hello world"}
+	b.ReportAllocs()
+	b.SetBytes(int64(len("id: 42\nevent: tick\ndata: hello world\n\n")))
+	b.ResetTimer()
+
+	for b.Loop() {
+		if err := pusher.Push(msg); err != nil {
+			b.Fatalf("Push() error = %v", err)
+		}
 	}
 }
 

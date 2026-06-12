@@ -29,7 +29,7 @@ Module path: `ella.to/sse`
 ## Install
 
 ```bash
-go get ella.to/sse@v0.2.3
+go get ella.to/sse@v0.2.4
 ```
 
 ## API at a glance

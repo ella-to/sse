@@ -3,10 +3,11 @@ package sse
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,76 +15,131 @@ import (
 
 var LibVersion = "0.2.1"
 
+const (
+	// defaultReaderSize is the bufio.Reader buffer size used when parsing
+	// streams. Lines shorter than this are parsed without any copying
+	// beyond the final string conversion.
+	defaultReaderSize = 4096
+
+	// maxPushBufferRetain caps the scratch buffer capacity an HttpPusher
+	// keeps alive between pushes, so a single large message does not pin
+	// memory for the lifetime of the connection.
+	maxPushBufferRetain = 64 << 10
+)
+
 type Message struct {
 	Id    string
 	Event string
 	Data  string
 }
 
+// trimLineEnd strips a trailing LF or CRLF.
+func trimLineEnd(b []byte) []byte {
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
+		if n = len(b); n > 0 && b[n-1] == '\r' {
+			b = b[:n-1]
+		}
+	}
+	return b
+}
+
+// grow ensures dst has capacity for at least need bytes, at least doubling
+// the capacity when reallocating. Plain append grows large slices by only
+// ~1.25x, which costs noticeably more allocations when accumulating big
+// payloads from small reads.
+func grow(dst []byte, need int) []byte {
+	if need <= cap(dst) {
+		return dst
+	}
+	nb := make([]byte, len(dst), max(2*cap(dst), need, 64))
+	copy(nb, dst)
+	return nb
+}
+
+func appendGrow(dst, src []byte) []byte {
+	dst = grow(dst, len(dst)+len(src))
+	return append(dst, src...)
+}
+
+// readLine returns the next line from br without its line ending. The
+// returned slice aliases br's internal buffer (or *spill for lines longer
+// than that buffer) and is only valid until the next call.
+func readLine(br *bufio.Reader, spill *[]byte) ([]byte, error) {
+	line, err := br.ReadSlice('\n')
+	if err == nil {
+		return trimLineEnd(line), nil
+	}
+
+	if err != bufio.ErrBufferFull {
+		if err == io.EOF && len(line) > 0 {
+			return trimLineEnd(line), io.EOF
+		}
+		return nil, err
+	}
+
+	buf := appendGrow((*spill)[:0], line)
+	for {
+		line, err = br.ReadSlice('\n')
+		buf = appendGrow(buf, line)
+		if err != bufio.ErrBufferFull {
+			break
+		}
+	}
+	*spill = buf
+
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	return trimLineEnd(buf), err
+}
+
+// appendDataLine accumulates one data (or comment) line into msg. The first
+// line is stored directly in msg.Data so single-line messages, by far the
+// common case, never touch the multi-line accumulator.
+func appendDataLine(msg *Message, dataBuf *[]byte, haveData *bool, value []byte) {
+	if !*haveData {
+		*haveData = true
+		msg.Data = string(value)
+		return
+	}
+
+	buf := *dataBuf
+	if buf == nil {
+		buf = make([]byte, 0, max(2*(len(msg.Data)+len(value)+1), 64))
+		buf = append(buf, msg.Data...)
+	}
+	buf = grow(buf, len(buf)+len(value)+1)
+	buf = append(buf, '\n')
+	buf = append(buf, value...)
+	*dataBuf = buf
+}
+
 func ReadMessage(r io.Reader) (*Message, error) {
 	br, ok := r.(*bufio.Reader)
 	if !ok {
-		br = bufio.NewReaderSize(r, 4096)
+		br = bufio.NewReaderSize(r, defaultReaderSize)
 	}
 
-	trimLineEnd := func(b []byte) []byte {
-		if n := len(b); n > 0 && b[n-1] == '\n' {
-			b = b[:n-1]
-			if n = len(b); n > 0 && b[n-1] == '\r' {
-				b = b[:n-1]
-			}
-		}
-		return b
-	}
-
-	var lineBuf bytes.Buffer
-	readLine := func() ([]byte, error) {
-		line, err := br.ReadSlice('\n')
-		if err == nil {
-			return trimLineEnd(line), nil
-		}
-
-		if err != bufio.ErrBufferFull {
-			if err == io.EOF && len(line) > 0 {
-				return trimLineEnd(line), io.EOF
-			}
-			return nil, err
-		}
-
-		lineBuf.Reset()
-		lineBuf.Write(line)
-		for {
-			line, err = br.ReadSlice('\n')
-			lineBuf.Write(line)
-			if err != bufio.ErrBufferFull {
-				break
-			}
-		}
-
-		if err != nil && err != io.EOF {
-			return nil, err
-		}
-
-		return trimLineEnd(lineBuf.Bytes()), err
-	}
-
-	var msg Message
-	var dataBuf bytes.Buffer
+	msg := &Message{}
+	var spill []byte   // long-line overflow, allocated only when needed
+	var dataBuf []byte // multi-line data accumulator, allocated only when needed
 	haveMessage := false
 	haveData := false
 
 	for {
-		line, err := readLine()
+		line, err := readLine(br, &spill)
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
 
 		if len(line) == 0 {
 			if haveMessage {
-				if haveData {
-					msg.Data = dataBuf.String()
+				if dataBuf != nil {
+					msg.Data = string(dataBuf)
 				}
-				return &msg, nil
+				return msg, nil
 			}
 
 			if err == io.EOF {
@@ -99,15 +155,11 @@ func ReadMessage(r io.Reader) (*Message, error) {
 			if len(comment) > 0 && comment[0] == ' ' {
 				comment = comment[1:]
 			}
-			if haveData {
-				dataBuf.WriteByte('\n')
-			}
-			dataBuf.Write(comment)
-			haveData = true
+			appendDataLine(msg, &dataBuf, &haveData, comment)
 		} else {
 			sep := bytes.IndexByte(line, ':')
 			field := line
-			value := []byte{}
+			var value []byte
 			if sep >= 0 {
 				field = line[:sep]
 				value = line[sep+1:]
@@ -116,20 +168,16 @@ func ReadMessage(r io.Reader) (*Message, error) {
 				}
 			}
 
-			switch {
-			case bytes.Equal(field, []byte("data")):
+			switch string(field) {
+			case "data":
 				haveMessage = true
-				if haveData {
-					dataBuf.WriteByte('\n')
-				}
-				dataBuf.Write(value)
-				haveData = true
-			case bytes.Equal(field, []byte("id")):
+				appendDataLine(msg, &dataBuf, &haveData, value)
+			case "id":
 				haveMessage = true
 				if bytes.IndexByte(value, 0) < 0 {
 					msg.Id = string(value)
 				}
-			case bytes.Equal(field, []byte("event")):
+			case "event":
 				haveMessage = true
 				msg.Event = string(value)
 			}
@@ -137,10 +185,10 @@ func ReadMessage(r io.Reader) (*Message, error) {
 
 		if err == io.EOF {
 			if haveMessage {
-				if haveData {
-					msg.Data = dataBuf.String()
+				if dataBuf != nil {
+					msg.Data = string(dataBuf)
 				}
-				return &msg, nil
+				return msg, nil
 			}
 			return nil, io.EOF
 		}
@@ -148,6 +196,15 @@ func ReadMessage(r io.Reader) (*Message, error) {
 }
 
 func WriteMessage(w io.Writer, msg *Message, buf *bytes.Buffer) error {
+	// For large payloads, pre-size the buffer in one shot instead of paying
+	// repeated grow-and-copy steps. For small payloads the extra scan of
+	// msg.Data costs more than it saves, so skip it.
+	if len(msg.Data) >= 1024 {
+		size := 1 + len("id: \n") + len(msg.Id) + len("event: \n") + len(msg.Event) +
+			len(msg.Data) + (strings.Count(msg.Data, "\n")+1)*len("data: \n")
+		buf.Grow(size)
+	}
+
 	isComment := true
 
 	if msg.Id != "" {
@@ -165,18 +222,22 @@ func WriteMessage(w io.Writer, msg *Message, buf *bytes.Buffer) error {
 	}
 
 	if msg.Data != "" {
-		start := 0
-		for i := 0; i <= len(msg.Data); i++ {
-			if i == len(msg.Data) || msg.Data[i] == '\n' {
-				if isComment {
-					buf.WriteString(": ")
-				} else {
-					buf.WriteString("data: ")
-				}
-				buf.WriteString(msg.Data[start:i])
+		prefix := "data: "
+		if isComment {
+			prefix = ": "
+		}
+		data := msg.Data
+		for {
+			i := strings.IndexByte(data, '\n')
+			buf.WriteString(prefix)
+			if i < 0 {
+				buf.WriteString(data)
 				buf.WriteByte('\n')
-				start = i + 1
+				break
 			}
+			buf.WriteString(data[:i])
+			buf.WriteByte('\n')
+			data = data[i+1:]
 		}
 	}
 
@@ -191,6 +252,8 @@ func NewComment(data string) *Message {
 	}
 }
 
+var pingMessage = NewComment("ping")
+
 type Pusher interface {
 	Push(msg *Message) error
 	Close() error
@@ -201,20 +264,13 @@ type HttpPusher struct {
 	flusher      http.Flusher
 	closer       io.Closer
 	pingDuration time.Duration
-	pingCancel   func()
+	pingTimer    *time.Timer
 	closed       atomic.Bool
 	mux          sync.Mutex
 	buffer       bytes.Buffer
 }
 
 var _ Pusher = (*HttpPusher)(nil)
-
-func setTimeout(d time.Duration, timeoutFunc func()) func() {
-	timer := time.AfterFunc(d, timeoutFunc)
-	return func() {
-		timer.Stop()
-	}
-}
 
 func (p *HttpPusher) Push(msg *Message) error {
 	if p.closed.Load() {
@@ -228,23 +284,22 @@ func (p *HttpPusher) Push(msg *Message) error {
 		return http.ErrServerClosed
 	}
 
-	if p.pingDuration > 0 {
-		if p.pingCancel != nil {
-			p.pingCancel()
-		}
-		p.pingCancel = setTimeout(p.pingDuration, func() {
-			_ = p.Push(NewComment("ping"))
-		})
-	}
-
 	p.buffer.Reset()
-
 	err := WriteMessage(p.w, msg, &p.buffer)
+	if p.buffer.Cap() > maxPushBufferRetain {
+		p.buffer = bytes.Buffer{}
+	}
 	if err != nil {
 		return err
 	}
 
 	p.flusher.Flush()
+
+	// Reset the idle keepalive only after a successful write, so a dead
+	// connection does not keep re-arming its own ping chain forever.
+	if p.pingTimer != nil {
+		p.pingTimer.Reset(p.pingDuration)
+	}
 
 	return nil
 }
@@ -255,9 +310,9 @@ func (p *HttpPusher) Close() error {
 	}
 
 	p.mux.Lock()
-	if p.pingCancel != nil {
-		p.pingCancel()
-		p.pingCancel = nil
+	if p.pingTimer != nil {
+		p.pingTimer.Stop()
+		p.pingTimer = nil
 	}
 	closer := p.closer
 	p.mux.Unlock()
@@ -306,6 +361,12 @@ func CreateHttpPusher(w http.ResponseWriter, opts ...HttpPusherOption) (*HttpPus
 
 	out.Flush()
 
+	if pusher.pingDuration > 0 {
+		pusher.pingTimer = time.AfterFunc(pusher.pingDuration, func() {
+			_ = pusher.Push(pingMessage)
+		})
+	}
+
 	return pusher, nil
 }
 
@@ -315,22 +376,21 @@ type Receiver interface {
 }
 
 type HttpReceiver struct {
-	url        string
 	client     *http.Client
-	requestURL *url.URL
-	baseHeader http.Header
-	body       io.ReadCloser
-	reader     *bufio.Reader
+	req        *http.Request
 	retryMax   int
 	retryDelay time.Duration
 	respHeader func(header http.Header)
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	lastEventID string
 	closed      atomic.Bool
-	closeOnce   sync.Once
-	closeCh     chan struct{}
 	mux         sync.Mutex
 	recvMux     sync.Mutex
+	body        io.ReadCloser
+	reader      *bufio.Reader // reused across reconnects
 }
 
 var _ Receiver = (*HttpReceiver)(nil)
@@ -382,10 +442,7 @@ func (r *HttpReceiver) Close() error {
 		return http.ErrServerClosed
 	}
 
-	r.closeOnce.Do(func() {
-		close(r.closeCh)
-	})
-
+	r.cancel()
 	r.closeBody()
 
 	return nil
@@ -403,12 +460,7 @@ func (r *HttpReceiver) connect() error {
 			return http.ErrServerClosed
 		}
 
-		u := *r.requestURL
-		req := &http.Request{
-			Method: http.MethodGet,
-			URL:    &u,
-			Header: r.baseHeader.Clone(),
-		}
+		req := r.req.Clone(r.ctx)
 
 		r.mux.Lock()
 		lastEventID := r.lastEventID
@@ -449,7 +501,11 @@ func (r *HttpReceiver) connect() error {
 			_ = r.body.Close()
 		}
 		r.body = resp.Body
-		r.reader = bufio.NewReaderSize(resp.Body, 4096)
+		if r.reader == nil {
+			r.reader = bufio.NewReaderSize(resp.Body, defaultReaderSize)
+		} else {
+			r.reader.Reset(resp.Body)
+		}
 		r.mux.Unlock()
 		return nil
 	}
@@ -472,7 +528,7 @@ func (r *HttpReceiver) waitRetry(attempt, attempts int) bool {
 	select {
 	case <-timer.C:
 		return true
-	case <-r.closeCh:
+	case <-r.ctx.Done():
 		return false
 	}
 }
@@ -481,7 +537,6 @@ func (r *HttpReceiver) closeBody() {
 	r.mux.Lock()
 	body := r.body
 	r.body = nil
-	r.reader = nil
 	r.mux.Unlock()
 
 	if body != nil {
@@ -491,10 +546,10 @@ func (r *HttpReceiver) closeBody() {
 
 func (r *HttpReceiver) getReader() (*bufio.Reader, error) {
 	r.mux.Lock()
-	reader := r.reader
+	reader, connected := r.reader, r.body != nil
 	r.mux.Unlock()
 
-	if reader != nil {
+	if connected {
 		return reader, nil
 	}
 
@@ -503,9 +558,9 @@ func (r *HttpReceiver) getReader() (*bufio.Reader, error) {
 	}
 
 	r.mux.Lock()
-	reader = r.reader
+	reader, connected = r.reader, r.body != nil
 	r.mux.Unlock()
-	if reader == nil {
+	if !connected {
 		return nil, io.EOF
 	}
 
@@ -534,22 +589,23 @@ func WithHttpReceiverRespHeader(respHeader func(header http.Header)) HttpReceive
 }
 
 func CreateHttpReceiver(receiverURL string, opts ...HttpReceiverOption) (*HttpReceiver, error) {
-	parsedURL, err := url.Parse(receiverURL)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, receiverURL, nil)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
 
 	receiver := &HttpReceiver{
-		url:        receiverURL,
 		client:     http.DefaultClient,
-		requestURL: parsedURL,
-		baseHeader: http.Header{
-			"Accept":        []string{"text/event-stream"},
-			"Cache-Control": []string{"no-cache"},
-		},
+		req:        req,
 		retryMax:   3,
 		retryDelay: 1 * time.Second,
-		closeCh:    make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	for _, opt := range opts {
@@ -557,6 +613,7 @@ func CreateHttpReceiver(receiverURL string, opts ...HttpReceiverOption) (*HttpRe
 	}
 
 	if err := receiver.connect(); err != nil {
+		cancel()
 		return nil, err
 	}
 
