@@ -76,6 +76,16 @@ type Receiver interface {
 func CreateHttpReceiver(url string, opts ...HttpReceiverOption) (*HttpReceiver, error)
 func WithHttpReceiverClient(client *http.Client) HttpReceiverOption
 func WithHttpReceiverRetry(max int, delay time.Duration) HttpReceiverOption
+func WithHttpReceiverRespHeader(fn func(header http.Header)) HttpReceiverOption
+func WithHttpReceiverHeader(key, value string) HttpReceiverOption
+func WithHttpReceiverRequest(fn func(req *http.Request)) HttpReceiverOption
+func WithHttpReceiverLastEventID(id string) HttpReceiverOption
+
+// Returned (wrapped) when the server answers with a non-200 status.
+type StatusError struct {
+    Code int
+    Body string
+}
 ```
 
 ## Basic usage
@@ -172,11 +182,34 @@ func main() {
 }
 ```
 
+### Client: auth headers, status errors, resuming from a cursor
+
+```go
+receiver, err := sse.CreateHttpReceiver(
+    "http://localhost:8080/events",
+    sse.WithHttpReceiverRetry(1, 0),
+    // Fixed header on every request, including reconnects.
+    sse.WithHttpReceiverHeader("X-Pipe-Peer", "peer-a"),
+    // Per-request hook, runs right before each request is sent.
+    sse.WithHttpReceiverRequest(func(req *http.Request) {
+        req.Header.Set("Authorization", "Bearer "+currentToken())
+    }),
+    // Resume from an ID persisted by a previous receiver.
+    sse.WithHttpReceiverLastEventID(savedCursor),
+)
+
+var statusErr *sse.StatusError
+if errors.As(err, &statusErr) && statusErr.Code == http.StatusUnauthorized {
+    // bad token: do not retry
+}
+```
+
 ## Behavior notes
 
 - `Receive()` blocks until a message is available or an error happens.
 - `HttpReceiver` reconnects when the stream breaks.
-- `Last-Event-ID` is tracked from received message IDs and sent on reconnect.
+- `Last-Event-ID` is tracked from received message IDs and sent on reconnect. Seed the initial value with `WithHttpReceiverLastEventID`.
+- Non-200 responses surface as `*sse.StatusError` (via `errors.As`) carrying the status code and up to 8 KiB of the response body.
 - Calling `Close()` on receiver unblocks `Receive()` and closes the active connection.
 - Calling `Close()` on pusher prevents further writes and closes the underlying writer when supported.
 

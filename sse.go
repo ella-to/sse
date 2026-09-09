@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var LibVersion = "0.2.1"
+var LibVersion = "0.2.5"
 
 const (
 	// defaultReaderSize is the bufio.Reader buffer size used when parsing
@@ -25,7 +25,23 @@ const (
 	// keeps alive between pushes, so a single large message does not pin
 	// memory for the lifetime of the connection.
 	maxPushBufferRetain = 64 << 10
+
+	// maxStatusErrorBody caps how much of a non-200 response body is
+	// captured into StatusError.Body.
+	maxStatusErrorBody = 8 << 10
 )
+
+// StatusError is returned (wrapped) by CreateHttpReceiver and Receive when
+// the server answers a stream request with a status other than 200 OK.
+// Use errors.As to inspect the code, for example to stop retrying on 401.
+type StatusError struct {
+	Code int
+	Body string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("unexpected status code: %d", e.Code)
+}
 
 type Message struct {
 	Id    string
@@ -381,6 +397,7 @@ type HttpReceiver struct {
 	retryMax   int
 	retryDelay time.Duration
 	respHeader func(header http.Header)
+	reqHooks   []func(req *http.Request)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -469,6 +486,10 @@ func (r *HttpReceiver) connect() error {
 			req.Header.Set("Last-Event-ID", lastEventID)
 		}
 
+		for _, hook := range r.reqHooks {
+			hook(req)
+		}
+
 		resp, err := r.client.Do(req)
 		if err != nil {
 			lastErr = err
@@ -479,8 +500,9 @@ func (r *HttpReceiver) connect() error {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxStatusErrorBody))
 			resp.Body.Close()
+			lastErr = &StatusError{Code: resp.StatusCode, Body: string(body)}
 			if !r.waitRetry(attempt, attempts) {
 				return http.ErrServerClosed
 			}
@@ -585,6 +607,35 @@ func WithHttpReceiverRetry(max int, delay time.Duration) HttpReceiverOption {
 func WithHttpReceiverRespHeader(respHeader func(header http.Header)) HttpReceiverOption {
 	return func(r *HttpReceiver) {
 		r.respHeader = respHeader
+	}
+}
+
+// WithHttpReceiverHeader sets a fixed header on every stream request,
+// including reconnects.
+func WithHttpReceiverHeader(key, value string) HttpReceiverOption {
+	return func(r *HttpReceiver) {
+		r.req.Header.Set(key, value)
+	}
+}
+
+// WithHttpReceiverRequest registers a hook that runs on each stream request
+// right before it is sent, after Last-Event-ID has been set. Use it for
+// per-request values such as rotating bearer tokens. Hooks run in the order
+// they were registered.
+func WithHttpReceiverRequest(fn func(req *http.Request)) HttpReceiverOption {
+	return func(r *HttpReceiver) {
+		if fn != nil {
+			r.reqHooks = append(r.reqHooks, fn)
+		}
+	}
+}
+
+// WithHttpReceiverLastEventID seeds the Last-Event-ID sent on the initial
+// connection, so a receiver can resume a stream from a cursor persisted by
+// a previous receiver.
+func WithHttpReceiverLastEventID(id string) HttpReceiverOption {
+	return func(r *HttpReceiver) {
+		r.lastEventID = id
 	}
 }
 

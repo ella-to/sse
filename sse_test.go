@@ -576,6 +576,146 @@ func TestHttpReceiverReceiveReturnsErrorWhenReconnectFails(t *testing.T) {
 	_ = receiver.Close()
 }
 
+func TestHttpReceiverHeaderAndRequestHookOnEveryConnect(t *testing.T) {
+	t.Parallel()
+
+	type seen struct {
+		auth string
+		peer string
+	}
+
+	var connCount atomic.Int32
+	headers := make(chan seen, 2)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		headers <- seen{
+			auth: req.Header.Get("Authorization"),
+			peer: req.Header.Get("X-Pipe-Peer"),
+		}
+		n := connCount.Add(1)
+		_, _ = io.WriteString(w, "id: "+strconv.Itoa(int(n))+"\ndata: msg\n\n")
+	}))
+	defer server.Close()
+
+	var tokenCalls atomic.Int32
+	receiver, err := CreateHttpReceiver(
+		server.URL,
+		WithHttpReceiverClient(server.Client()),
+		WithHttpReceiverRetry(3, time.Millisecond),
+		WithHttpReceiverHeader("X-Pipe-Peer", "peer-a"),
+		WithHttpReceiverRequest(func(req *http.Request) {
+			n := tokenCalls.Add(1)
+			req.Header.Set("Authorization", "Bearer token-"+strconv.Itoa(int(n)))
+		}),
+	)
+	if err != nil {
+		t.Fatalf("CreateHttpReceiver() error = %v", err)
+	}
+	defer func() {
+		_ = receiver.Close()
+	}()
+
+	// First message from the initial connection, second one forces a
+	// reconnect since the server closes the stream after each message.
+	for i := range 2 {
+		if _, err := receiver.Receive(); err != nil {
+			t.Fatalf("Receive() #%d error = %v", i+1, err)
+		}
+	}
+
+	want := []seen{
+		{auth: "Bearer token-1", peer: "peer-a"},
+		{auth: "Bearer token-2", peer: "peer-a"},
+	}
+	for i, w := range want {
+		select {
+		case got := <-headers:
+			if got != w {
+				t.Fatalf("connection #%d headers = %+v, want %+v", i+1, got, w)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for connection #%d", i+1)
+		}
+	}
+}
+
+func TestHttpReceiverStatusErrorExposesCodeAndBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"bad token"}`)
+	}))
+	defer server.Close()
+
+	_, err := CreateHttpReceiver(
+		server.URL,
+		WithHttpReceiverClient(server.Client()),
+		WithHttpReceiverRetry(1, 0),
+	)
+	if err == nil {
+		t.Fatal("CreateHttpReceiver() expected error, got nil")
+	}
+
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("CreateHttpReceiver() error = %v, want StatusError via errors.As", err)
+	}
+	if statusErr.Code != http.StatusUnauthorized {
+		t.Fatalf("StatusError.Code = %d, want %d", statusErr.Code, http.StatusUnauthorized)
+	}
+	if statusErr.Body != `{"error":"bad token"}` {
+		t.Fatalf("StatusError.Body = %q, want %q", statusErr.Body, `{"error":"bad token"}`)
+	}
+	if !strings.Contains(err.Error(), "unexpected status code: 401") {
+		t.Fatalf("error text = %q, want it to mention unexpected status code: 401", err.Error())
+	}
+}
+
+func TestHttpReceiverInitialLastEventID(t *testing.T) {
+	t.Parallel()
+
+	lastEventIDSeen := make(chan string, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		lastEventIDSeen <- req.Header.Get("Last-Event-ID")
+		_, _ = io.WriteString(w, "id: 43\ndata: next\n\n")
+	}))
+	defer server.Close()
+
+	receiver, err := CreateHttpReceiver(
+		server.URL,
+		WithHttpReceiverClient(server.Client()),
+		WithHttpReceiverRetry(1, 0),
+		WithHttpReceiverLastEventID("42"),
+	)
+	if err != nil {
+		t.Fatalf("CreateHttpReceiver() error = %v", err)
+	}
+	defer func() {
+		_ = receiver.Close()
+	}()
+
+	select {
+	case got := <-lastEventIDSeen:
+		if got != "42" {
+			t.Fatalf("Last-Event-ID = %q, want %q", got, "42")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial connection")
+	}
+
+	msg, err := receiver.Receive()
+	if err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if msg.Id != "43" || msg.Data != "next" {
+		t.Fatalf("Receive() = %#v, want id=43 data=next", msg)
+	}
+}
+
 func TestThroughputMessagesPerSecond(t *testing.T) {
 	pr, pw := io.Pipe()
 
