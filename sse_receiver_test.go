@@ -226,3 +226,79 @@ func TestReceiverStopsAfterNoContent(t *testing.T) {
 		t.Fatalf("%d requests, want 2 (no reconnect after 204)", got)
 	}
 }
+
+func TestReceiverBacksOffOnEmptyConnections(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		// accept and close without sending anything
+	}))
+	defer server.Close()
+
+	r, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()), WithHttpReceiverRetry(3, 10*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Receive()
+		done <- err
+	}()
+	time.Sleep(400 * time.Millisecond)
+	r.Close()
+	if err := <-done; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("Receive error = %v", err)
+	}
+
+	// delays grow 10, 20, 40, 80, 160ms (halved by jitter at worst), so
+	// 400ms allows only a handful of connections; a tight loop makes hundreds
+	if got := calls.Load(); got > 12 {
+		t.Fatalf("%d connections in 400ms, reconnect is not backing off", got)
+	}
+}
+
+func TestReceiverHonoursRetryField(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) == 1 {
+			_, _ = io.WriteString(w, "retry: 150\nid: 1\ndata: a\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "id: 2\ndata: b\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	r, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()), WithHttpReceiverRetry(3, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if m, err := r.Receive(); err != nil || m.Id != "1" {
+		t.Fatalf("first = %v, %v", m, err)
+	}
+	start := time.Now()
+	if m, err := r.Receive(); err != nil || m.Id != "2" {
+		t.Fatalf("second = %v, %v", m, err)
+	}
+	if d := time.Since(start); d < 140*time.Millisecond {
+		t.Fatalf("reconnected after %v, want the server's 150ms retry", d)
+	}
+}
+
+func TestParseRetry(t *testing.T) {
+	for in, want := range map[string]time.Duration{"0": 0, "1500": 1500 * time.Millisecond} {
+		if got, ok := parseRetry([]byte(in)); !ok || got != want {
+			t.Errorf("parseRetry(%q) = %v, %v", in, got, ok)
+		}
+	}
+	for _, in := range []string{"", "1.5", "-1", "10s", "99999999999"} {
+		if _, ok := parseRetry([]byte(in)); ok {
+			t.Errorf("parseRetry(%q) accepted", in)
+		}
+	}
+}

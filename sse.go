@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"slices"
 	"sync"
@@ -30,6 +31,10 @@ const (
 
 	// defaultMaxMessageSize bounds a single message on an HttpReceiver.
 	defaultMaxMessageSize = 16 << 20
+
+	// maxReconnectBackoff caps the reconnect backoff for connections that
+	// deliver nothing.
+	maxReconnectBackoff = 30 * time.Second
 
 	// maxReadBufferRetain caps the scratch capacity a receiver keeps between
 	// messages.
@@ -160,11 +165,12 @@ func readLine(br *bufio.Reader, spill *[]byte, limit int) ([]byte, error) {
 // readState holds the scratch buffers of one stream reader so they are
 // reused from message to message instead of being reallocated.
 type readState struct {
-	spill   []byte // long-line overflow
-	dataBuf []byte // multi-line data accumulator
-	multi   bool   // dataBuf holds the data of the current message
-	maxSize int    // bytes allowed per message, 0 for no limit
-	event   string // last event name seen, reused across messages
+	spill   []byte        // long-line overflow
+	dataBuf []byte        // multi-line data accumulator
+	multi   bool          // dataBuf holds the data of the current message
+	maxSize int           // bytes allowed per message, 0 for no limit
+	retry   time.Duration // last retry: value sent by the server
+	event   string        // last event name seen, reused across messages
 }
 
 // release drops buffers that grew past maxReadBufferRetain, so one huge
@@ -209,6 +215,21 @@ func ReadMessage(r io.Reader) (*Message, error) {
 		return nil, err
 	}
 	return msg, nil
+}
+
+// parseRetry parses the value of a retry: field (ASCII digits, in ms).
+func parseRetry(v []byte) (time.Duration, bool) {
+	if len(v) == 0 || len(v) > 10 {
+		return 0, false
+	}
+	var ms int64
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		ms = ms*10 + int64(c-'0')
+	}
+	return time.Duration(ms) * time.Millisecond, true
 }
 
 // readMessage parses the next message from br into msg, overwriting all of
@@ -273,6 +294,11 @@ func readMessage(br *bufio.Reader, msg *Message, st *readState) error {
 			case "data":
 				haveMessage = true
 				st.appendData(msg, &haveData, value)
+			case "retry":
+				// reconnection time in milliseconds; ignored unless all digits
+				if ms, ok := parseRetry(value); ok {
+					st.retry = ms
+				}
 			case "id":
 				haveMessage = true
 				if bytes.IndexByte(value, 0) < 0 {
@@ -698,6 +724,8 @@ type HttpReceiver struct {
 	reader      *bufio.Reader // reused across reconnects
 	connected   bool          // reader is attached to a live body
 	terminal    error         // set once the server answered 204: never reconnect
+	gotMessage  bool          // the current connection delivered a message
+	emptyConns  int           // consecutive connections that delivered nothing
 
 	closed atomic.Bool
 	mux    sync.Mutex // guards body, which Close touches concurrently
@@ -738,6 +766,7 @@ func (r *HttpReceiver) ReceiveInto(msg *Message) error {
 
 		err = readMessage(reader, msg, &r.rs)
 		if err == nil {
+			r.gotMessage = true
 			if msg.Id != "" {
 				r.lastEventID = msg.Id
 			}
@@ -755,6 +784,10 @@ func (r *HttpReceiver) ReceiveInto(msg *Message) error {
 			// the stream is mid-message; reconnecting would most likely
 			// replay the same message, so let the caller decide
 			return err
+		}
+
+		if !r.sleep(r.reconnectDelay()) {
+			return r.done()
 		}
 
 		if err := r.connect(); err != nil {
@@ -862,6 +895,7 @@ func (r *HttpReceiver) connect() error {
 			r.reader.Reset(resp.Body)
 		}
 		r.connected = true
+		r.gotMessage = false
 		return nil
 	}
 
@@ -887,11 +921,56 @@ func permanentStatus(code int) bool {
 }
 
 func (r *HttpReceiver) waitRetry(attempt, attempts int) bool {
-	if attempt >= attempts-1 || r.retryDelay <= 0 {
+	if attempt >= attempts-1 {
+		return true
+	}
+	return r.sleep(r.retryBase())
+}
+
+// retryBase is the reconnection delay: the server's retry: value when it
+// sent one, otherwise the configured retry delay.
+func (r *HttpReceiver) retryBase() time.Duration {
+	if r.rs.retry > 0 {
+		return r.rs.retry
+	}
+	return r.retryDelay
+}
+
+// reconnectDelay is the pause before reconnecting a stream that dropped.
+// A stream that delivered messages is resumed right away (or after the
+// server's retry: value). A connection that delivered nothing, such as a
+// server or proxy that accepts and immediately closes, backs off
+// exponentially with jitter, up to maxReconnectBackoff, so it cannot turn
+// into a tight reconnect loop.
+func (r *HttpReceiver) reconnectDelay() time.Duration {
+	delay := r.rs.retry
+
+	if r.gotMessage {
+		r.emptyConns = 0
+		return delay
+	}
+
+	r.emptyConns++
+	base := r.retryBase()
+	if base <= 0 {
+		return delay
+	}
+	backoff := base << min(r.emptyConns-1, 16)
+	if backoff <= 0 || backoff > maxReconnectBackoff {
+		backoff = max(maxReconnectBackoff, base)
+	}
+	// full jitter in the upper half keeps reconnecting clients spread out
+	return backoff/2 + rand.N(backoff/2+1)
+}
+
+// sleep waits for d, returning false if the receiver is closed or its
+// context cancelled first.
+func (r *HttpReceiver) sleep(d time.Duration) bool {
+	if d <= 0 {
 		return true
 	}
 
-	timer := time.NewTimer(r.retryDelay)
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 
 	select {
