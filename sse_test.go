@@ -1245,3 +1245,35 @@ func benchmarkThroughput(b *testing.B, msgType, data string, numMessages int) {
 		receiver.Close()
 	}
 }
+
+var benchRecord = []byte(`{"id":"e_d4p2k1a0000000000000","subject":"orders.created","created_at":"2026-11-17T11:43:22.572492-05:00","payload":{"customer":"c_1234567890","items":[{"sku":"A-1","qty":2},{"sku":"B-7","qty":1}],"total":12345}}`)
+
+// BenchmarkPushRecord compares pushing a []byte record through Push (which
+// needs a string conversion per call, as bus did) with PushBytes.
+func BenchmarkPushRecord(b *testing.B) {
+	id := []byte("e_d4p2k1a0000000000000")
+
+	b.Run("Push", func(b *testing.B) {
+		p, _ := CreateHttpPusher(&discardResponseWriter{})
+		defer p.Close()
+		b.ReportAllocs()
+		b.SetBytes(int64(len(benchRecord)))
+		for b.Loop() {
+			if err := p.Push(&Message{Id: string(id), Event: "msg", Data: string(benchRecord)}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("PushBytes", func(b *testing.B) {
+		p, _ := CreateHttpPusher(&discardResponseWriter{})
+		defer p.Close()
+		b.ReportAllocs()
+		b.SetBytes(int64(len(benchRecord)))
+		for b.Loop() {
+			if err := p.PushBytes(id, "msg", benchRecord); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

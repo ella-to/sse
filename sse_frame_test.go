@@ -77,3 +77,50 @@ func TestWriteMessageEmptyData(t *testing.T) {
 		}
 	}
 }
+
+func TestAppendMessageMatchesWriteMessage(t *testing.T) {
+	big := bytes.Repeat([]byte("line\n"), 400)
+	cases := []*Message{
+		{Id: "1", Event: "msg", Data: "hello"},
+		{Data: "comment\nsecond"},
+		{Event: "x", Data: "a\n\nb\n"},
+		{Id: "e_1", Data: string(big)},
+		{},
+	}
+	for _, m := range cases {
+		var out, buf bytes.Buffer
+		if err := WriteMessage(&out, m, &buf); err != nil {
+			t.Fatal(err)
+		}
+		prefix := []byte("keep")
+		got, err := AppendMessage(prefix, []byte(m.Id), m.Event, []byte(m.Data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got[:4]) != "keep" || string(got[4:]) != out.String() {
+			t.Errorf("AppendMessage(%q) = %q, want %q", m.Id, got[4:], out.String())
+		}
+	}
+
+	if got, err := AppendMessage([]byte("x"), []byte("a\nb"), "", nil); !errors.Is(err, ErrInvalidField) || string(got) != "x" {
+		t.Errorf("invalid id: got %q, %v", got, err)
+	}
+}
+
+func TestPushBytes(t *testing.T) {
+	w := &recordingResponseWriter{}
+	p, err := CreateHttpPusher(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	data := []byte(`{"a":1}`)
+	if err := p.PushBytes([]byte("e_1"), "msg", data); err != nil {
+		t.Fatal(err)
+	}
+	data[2] = 'Z' // the pusher must not retain the slice
+	if out, _ := w.snapshot(); out != "id: e_1\nevent: msg\ndata: {\"a\":1}\n\n" {
+		t.Fatalf("output = %q", out)
+	}
+}

@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 var LibVersion = "0.2.5"
@@ -38,7 +39,7 @@ const (
 var ErrInvalidField = errors.New("sse: id or event contains a line break or NUL")
 
 // validField reports whether s can be written as a single-line field value.
-func validField(s string, isID bool) bool {
+func validField[T string | []byte](s T, isID bool) bool {
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case '\n', '\r':
@@ -233,63 +234,83 @@ func ReadMessage(r io.Reader) (*Message, error) {
 }
 
 func WriteMessage(w io.Writer, msg *Message, buf *bytes.Buffer) error {
-	if !validField(msg.Id, true) || !validField(msg.Event, false) {
-		return ErrInvalidField
+	frame, err := AppendMessage(buf.AvailableBuffer(), bytesOf(msg.Id), msg.Event, bytesOf(msg.Data))
+	if err != nil {
+		return err
+	}
+	buf.Write(frame)
+	_, err = w.Write(buf.Bytes())
+	return err
+}
+
+// AppendMessage appends one complete SSE frame (including the terminating
+// blank line) to dst and returns the extended slice. A message with neither
+// id nor event is written as a comment. It returns dst unchanged and
+// ErrInvalidField if id or event cannot be written on a single line.
+func AppendMessage(dst []byte, id []byte, event string, data []byte) ([]byte, error) {
+	if !validField(id, true) || !validField(event, false) {
+		return dst, ErrInvalidField
 	}
 
 	// For large payloads, pre-size the buffer in one shot instead of paying
 	// repeated grow-and-copy steps. For small payloads the extra scan of
-	// msg.Data costs more than it saves, so skip it.
-	if len(msg.Data) >= 1024 {
-		size := 1 + len("id: \n") + len(msg.Id) + len("event: \n") + len(msg.Event) +
-			len(msg.Data) + (strings.Count(msg.Data, "\n")+1)*len("data: \n")
-		buf.Grow(size)
+	// data costs more than it saves, so skip it.
+	if len(data) >= 1024 {
+		size := 1 + len("id: \n") + len(id) + len("event: \n") + len(event) +
+			len(data) + (bytes.Count(data, newline)+1)*len("data: \n")
+		dst = slices.Grow(dst, size)
 	}
 
 	isComment := true
 
-	if msg.Id != "" {
-		buf.WriteString("id: ")
-		buf.WriteString(msg.Id)
-		buf.WriteByte('\n')
+	if len(id) > 0 {
+		dst = append(dst, "id: "...)
+		dst = append(dst, id...)
+		dst = append(dst, '\n')
 		isComment = false
 	}
 
-	if msg.Event != "" {
-		buf.WriteString("event: ")
-		buf.WriteString(msg.Event)
-		buf.WriteByte('\n')
+	if event != "" {
+		dst = append(dst, "event: "...)
+		dst = append(dst, event...)
+		dst = append(dst, '\n')
 		isComment = false
 	}
 
-	if msg.Data == "" && !isComment {
-		// without a data line browsers do not dispatch the event
-		buf.WriteString("data:\n")
+	if len(data) == 0 {
+		if !isComment {
+			// without a data line browsers do not dispatch the event
+			dst = append(dst, "data:\n"...)
+		}
+		return append(dst, '\n'), nil
 	}
 
-	if msg.Data != "" {
-		prefix := "data: "
-		if isComment {
-			prefix = ": "
+	prefix := "data: "
+	if isComment {
+		prefix = ": "
+	}
+	for {
+		i := bytes.IndexByte(data, '\n')
+		dst = append(dst, prefix...)
+		if i < 0 {
+			dst = append(dst, data...)
+			dst = append(dst, '\n')
+			break
 		}
-		data := msg.Data
-		for {
-			i := strings.IndexByte(data, '\n')
-			buf.WriteString(prefix)
-			if i < 0 {
-				buf.WriteString(data)
-				buf.WriteByte('\n')
-				break
-			}
-			buf.WriteString(data[:i])
-			buf.WriteByte('\n')
-			data = data[i+1:]
-		}
+		dst = append(dst, data[:i]...)
+		dst = append(dst, '\n')
+		data = data[i+1:]
 	}
 
-	buf.WriteByte('\n')
-	_, err := w.Write(buf.Bytes())
-	return err
+	return append(dst, '\n'), nil
+}
+
+var newline = []byte{'\n'}
+
+// bytesOf returns a read-only view of s without copying. The result must
+// never be modified.
+func bytesOf(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 func NewComment(data string) *Message {
@@ -313,12 +334,23 @@ type HttpPusher struct {
 	pingTimer    *time.Timer
 	closed       atomic.Bool
 	mux          sync.Mutex
-	buffer       bytes.Buffer
+	buf          []byte // scratch frame buffer, reused across pushes
 }
 
 var _ Pusher = (*HttpPusher)(nil)
 
+// Push writes msg and flushes it to the client.
 func (p *HttpPusher) Push(msg *Message) error {
+	return p.send(bytesOf(msg.Id), msg.Event, bytesOf(msg.Data))
+}
+
+// PushBytes is Push for a message held as byte slices. It writes and flushes
+// one frame without converting data to a string; the slices are not retained.
+func (p *HttpPusher) PushBytes(id []byte, event string, data []byte) error {
+	return p.send(id, event, data)
+}
+
+func (p *HttpPusher) send(id []byte, event string, data []byte) error {
 	if p.closed.Load() {
 		return http.ErrServerClosed
 	}
@@ -330,10 +362,15 @@ func (p *HttpPusher) Push(msg *Message) error {
 		return http.ErrServerClosed
 	}
 
-	p.buffer.Reset()
-	err := WriteMessage(p.w, msg, &p.buffer)
-	if p.buffer.Cap() > maxPushBufferRetain {
-		p.buffer = bytes.Buffer{}
+	frame, err := AppendMessage(p.buf[:0], id, event, data)
+	if err != nil {
+		return err
+	}
+	_, err = p.w.Write(frame)
+	if cap(frame) <= maxPushBufferRetain {
+		p.buf = frame
+	} else {
+		p.buf = nil
 	}
 	if err != nil {
 		return err
