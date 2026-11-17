@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -228,5 +229,37 @@ func TestPusherEncoded(t *testing.T) {
 	want := "id: 1\nevent: msg\ndata: shared\n\n"
 	if got := w.Body.String(); got != want+want {
 		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestPusherPingOnlyWhenIdle(t *testing.T) {
+	w := &recordingResponseWriter{}
+	p, err := CreateHttpPusher(w, WithHttpPusherPingDuration(60*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// steady traffic faster than the ping duration: no pings
+	for i := 0; i < 20; i++ {
+		if err := p.Push(&Message{Id: "1", Data: "x"}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if out, _ := w.snapshot(); strings.Contains(out, ": ping") {
+		t.Fatalf("ping sent on a busy connection: %q", out)
+	}
+
+	// idle: a ping must arrive within roughly one ping duration
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		if out, _ := w.snapshot(); strings.Contains(out, ": ping\n\n") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no ping on an idle connection")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

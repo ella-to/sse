@@ -319,7 +319,8 @@ func NewComment(data string) *Message {
 	}
 }
 
-var pingMessage = NewComment("ping")
+// pingFrame is the keepalive comment sent on idle connections.
+var pingFrame = []byte(": ping\n\n")
 
 type Pusher interface {
 	Push(msg *Message) error
@@ -332,6 +333,9 @@ type HttpPusher struct {
 	closer       io.Closer
 	pingDuration time.Duration
 	pingTimer    *time.Timer
+	// active records that something was written since the last ping tick,
+	// so the hot path never touches the timer. Guarded by mux.
+	active       bool
 	writeTimeout time.Duration
 	closed       atomic.Bool
 	// writing is set while a write or flush to the connection is in
@@ -393,9 +397,7 @@ func (p *HttpPusher) sendEncoded(frame []byte, flush bool) error {
 			return err
 		}
 	}
-	if p.pingTimer != nil {
-		p.pingTimer.Reset(p.pingDuration)
-	}
+	p.active = true
 	return nil
 }
 
@@ -439,12 +441,7 @@ func (p *HttpPusher) send(id []byte, event string, data []byte, flush bool) erro
 		}
 	}
 
-	// Reset the idle keepalive only after a successful write, so a dead
-	// connection does not keep re-arming its own ping chain forever.
-	if p.pingTimer != nil {
-		p.pingTimer.Reset(p.pingDuration)
-	}
-
+	p.active = true
 	return nil
 }
 
@@ -483,6 +480,39 @@ func (p *HttpPusher) flushLocked() error {
 	err := p.rc.Flush()
 	p.writing.Store(false)
 	return err
+}
+
+// pingPeriod is half the ping duration: a tick sends a ping only if nothing
+// was written since the previous tick, and a ping counts as traffic, so the
+// connection is never idle for longer than pingDuration and an idle
+// connection is pinged once per pingDuration.
+func (p *HttpPusher) pingPeriod() time.Duration {
+	return max(p.pingDuration/2, 1)
+}
+
+// pingTick runs on the ping timer. A failed ping write stops the chain, so a
+// dead connection does not keep re-arming its own timer.
+func (p *HttpPusher) pingTick() {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
+	if p.pingTimer == nil || p.closed.Load() {
+		return
+	}
+
+	if p.active {
+		p.active = false
+	} else {
+		if err := p.writeLocked(pingFrame); err != nil {
+			return
+		}
+		if err := p.flushLocked(); err != nil {
+			return
+		}
+		p.active = true
+	}
+
+	p.pingTimer.Reset(p.pingPeriod())
 }
 
 // Close stops the pusher. A write blocked on a peer that stopped reading is
@@ -566,9 +596,9 @@ func CreateHttpPusher(w http.ResponseWriter, opts ...HttpPusherOption) (*HttpPus
 	}
 
 	if pusher.pingDuration > 0 {
-		pusher.pingTimer = time.AfterFunc(pusher.pingDuration, func() {
-			_ = pusher.Push(pingMessage)
-		})
+		pusher.mux.Lock()
+		pusher.pingTimer = time.AfterFunc(pusher.pingPeriod(), pusher.pingTick)
+		pusher.mux.Unlock()
 	}
 
 	return pusher, nil
