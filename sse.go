@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,26 @@ const (
 	// captured into StatusError.Body.
 	maxStatusErrorBody = 8 << 10
 )
+
+// ErrInvalidField is returned when a message id or event name contains a
+// line break (or the id contains NUL). Writing such a value would split the
+// frame and let the value inject extra fields or whole events.
+var ErrInvalidField = errors.New("sse: id or event contains a line break or NUL")
+
+// validField reports whether s can be written as a single-line field value.
+func validField(s string, isID bool) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\n', '\r':
+			return false
+		case 0:
+			if isID {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // StatusError is returned (wrapped) by CreateHttpReceiver and Receive when
 // the server answers a stream request with a status other than 200 OK.
@@ -212,6 +233,10 @@ func ReadMessage(r io.Reader) (*Message, error) {
 }
 
 func WriteMessage(w io.Writer, msg *Message, buf *bytes.Buffer) error {
+	if !validField(msg.Id, true) || !validField(msg.Event, false) {
+		return ErrInvalidField
+	}
+
 	// For large payloads, pre-size the buffer in one shot instead of paying
 	// repeated grow-and-copy steps. For small payloads the extra scan of
 	// msg.Data costs more than it saves, so skip it.
