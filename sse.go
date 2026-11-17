@@ -619,7 +619,8 @@ type HttpReceiver struct {
 	respHeader func(header http.Header)
 	reqHooks   []func(req *http.Request)
 
-	ctx    context.Context
+	parent context.Context // caller context, see WithHttpReceiverContext
+	ctx    context.Context // parent plus Close
 	cancel context.CancelFunc
 
 	lastEventID string
@@ -637,14 +638,14 @@ func (r *HttpReceiver) Receive() (*Message, error) {
 	defer r.recvMux.Unlock()
 
 	for {
-		if r.closed.Load() {
-			return nil, http.ErrServerClosed
+		if err := r.done(); err != nil {
+			return nil, err
 		}
 
 		reader, err := r.getReader()
 		if err != nil {
-			if r.closed.Load() {
-				return nil, http.ErrServerClosed
+			if err := r.done(); err != nil {
+				return nil, err
 			}
 			return nil, err
 		}
@@ -659,19 +660,29 @@ func (r *HttpReceiver) Receive() (*Message, error) {
 			return msg, nil
 		}
 
-		if r.closed.Load() {
-			return nil, http.ErrServerClosed
+		if err := r.done(); err != nil {
+			return nil, err
 		}
 
 		r.closeBody()
 
 		if err := r.connect(); err != nil {
-			if r.closed.Load() {
-				return nil, http.ErrServerClosed
+			if err := r.done(); err != nil {
+				return nil, err
 			}
 			return nil, err
 		}
 	}
+}
+
+// done returns the error Receive should report once the receiver can no
+// longer be used: http.ErrServerClosed after Close, or the caller context's
+// error once it is cancelled. It returns nil while the receiver is usable.
+func (r *HttpReceiver) done() error {
+	if r.closed.Load() {
+		return http.ErrServerClosed
+	}
+	return r.parent.Err()
 }
 
 func (r *HttpReceiver) Close() error {
@@ -693,8 +704,8 @@ func (r *HttpReceiver) connect() error {
 
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		if r.closed.Load() {
-			return http.ErrServerClosed
+		if err := r.done(); err != nil {
+			return err
 		}
 
 		req := r.req.Clone(r.ctx)
@@ -714,7 +725,7 @@ func (r *HttpReceiver) connect() error {
 		if err != nil {
 			lastErr = err
 			if !r.waitRetry(attempt, attempts) {
-				return http.ErrServerClosed
+				return r.done()
 			}
 			continue
 		}
@@ -724,7 +735,7 @@ func (r *HttpReceiver) connect() error {
 			resp.Body.Close()
 			lastErr = &StatusError{Code: resp.StatusCode, Body: string(body)}
 			if !r.waitRetry(attempt, attempts) {
-				return http.ErrServerClosed
+				return r.done()
 			}
 			continue
 		}
@@ -850,6 +861,17 @@ func WithHttpReceiverRequest(fn func(req *http.Request)) HttpReceiverOption {
 	}
 }
 
+// WithHttpReceiverContext ties the receiver to ctx: connecting (including the
+// initial connect in CreateHttpReceiver), reading and reconnecting stop when
+// ctx is cancelled, and Receive then returns ctx.Err().
+func WithHttpReceiverContext(ctx context.Context) HttpReceiverOption {
+	return func(r *HttpReceiver) {
+		if ctx != nil {
+			r.parent = ctx
+		}
+	}
+}
+
 // WithHttpReceiverLastEventID seeds the Last-Event-ID sent on the initial
 // connection, so a receiver can resume a stream from a cursor persisted by
 // a previous receiver.
@@ -860,11 +882,10 @@ func WithHttpReceiverLastEventID(id string) HttpReceiverOption {
 }
 
 func CreateHttpReceiver(receiverURL string, opts ...HttpReceiverOption) (*HttpReceiver, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, receiverURL, nil)
+	// the stored request is only a template; every attempt clones it with
+	// the receiver's context
+	req, err := http.NewRequest(http.MethodGet, receiverURL, nil)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 	req.Header.Set("Accept", "text/event-stream")
@@ -875,16 +896,20 @@ func CreateHttpReceiver(receiverURL string, opts ...HttpReceiverOption) (*HttpRe
 		req:        req,
 		retryMax:   3,
 		retryDelay: 1 * time.Second,
-		ctx:        ctx,
-		cancel:     cancel,
+		parent:     context.Background(),
 	}
 
 	for _, opt := range opts {
 		opt(receiver)
 	}
 
+	receiver.ctx, receiver.cancel = context.WithCancel(receiver.parent)
+
 	if err := receiver.connect(); err != nil {
-		cancel()
+		receiver.cancel()
+		if cerr := receiver.parent.Err(); cerr != nil {
+			return nil, cerr
+		}
 		return nil, err
 	}
 
