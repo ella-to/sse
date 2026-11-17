@@ -1277,3 +1277,46 @@ func BenchmarkPushRecord(b *testing.B) {
 		}
 	})
 }
+
+// benchmarkReceive streams frames with a payload of the given size over HTTP
+// and measures Receive (or ReceiveInto when into is set).
+func benchmarkReceive(b *testing.B, payloadSize int, into bool) {
+	payload := strings.Repeat("x", payloadSize)
+	frame := "id: 1\nevent: msg\ndata: " + payload + "\n\n"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for req.Context().Err() == nil {
+			if _, err := io.WriteString(w, frame); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	receiver, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()), WithHttpReceiverRetry(1, 0))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer receiver.Close()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(frame)))
+	var msg Message
+	for b.Loop() {
+		_, _ = into, &msg
+		m, err := receiver.Receive()
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchReadSink = m
+	}
+}
+
+func BenchmarkReceive(b *testing.B) {
+	for _, size := range []int{16, 8 << 10} {
+		b.Run("Receive/"+strconv.Itoa(size), func(b *testing.B) { benchmarkReceive(b, size, false) })
+	}
+}

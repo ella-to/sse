@@ -23,6 +23,15 @@ const (
 	// beyond the final string conversion.
 	defaultReaderSize = 4096
 
+	// defaultReceiverBufferSize is the bufio.Reader size of an HttpReceiver.
+	// Lines that fit are parsed without the spill copy; bus events routinely
+	// exceed the 4 KB that ReadMessage uses for plain readers.
+	defaultReceiverBufferSize = 32 << 10
+
+	// maxReadBufferRetain caps the scratch capacity a receiver keeps between
+	// messages.
+	maxReadBufferRetain = 1 << 20
+
 	// maxPushBufferRetain caps the scratch buffer capacity an HttpPusher
 	// keeps alive between pushes, so a single large message does not pin
 	// memory for the lifetime of the connection.
@@ -133,25 +142,42 @@ func readLine(br *bufio.Reader, spill *[]byte) ([]byte, error) {
 	return trimLineEnd(buf), err
 }
 
-// appendDataLine accumulates one data (or comment) line into msg. The first
-// line is stored directly in msg.Data so single-line messages, by far the
-// common case, never touch the multi-line accumulator.
-func appendDataLine(msg *Message, dataBuf *[]byte, haveData *bool, value []byte) {
+// readState holds the scratch buffers of one stream reader so they are
+// reused from message to message instead of being reallocated.
+type readState struct {
+	spill   []byte // long-line overflow
+	dataBuf []byte // multi-line data accumulator
+	multi   bool   // dataBuf holds the data of the current message
+}
+
+// release drops buffers that grew past maxReadBufferRetain, so one huge
+// message does not pin memory for the lifetime of a stream.
+func (st *readState) release() {
+	if cap(st.spill) > maxReadBufferRetain {
+		st.spill = nil
+	}
+	if cap(st.dataBuf) > maxReadBufferRetain {
+		st.dataBuf = nil
+	}
+}
+
+// appendData accumulates one data (or comment) line into msg. The first line
+// is stored directly in msg.Data so single-line messages, by far the common
+// case, never touch the multi-line accumulator.
+func (st *readState) appendData(msg *Message, haveData *bool, value []byte) {
 	if !*haveData {
 		*haveData = true
 		msg.Data = string(value)
 		return
 	}
 
-	buf := *dataBuf
-	if buf == nil {
-		buf = make([]byte, 0, max(2*(len(msg.Data)+len(value)+1), 64))
-		buf = append(buf, msg.Data...)
+	if !st.multi {
+		st.multi = true
+		st.dataBuf = appendGrow(st.dataBuf[:0], bytesOf(msg.Data))
 	}
-	buf = grow(buf, len(buf)+len(value)+1)
-	buf = append(buf, '\n')
-	buf = append(buf, value...)
-	*dataBuf = buf
+	st.dataBuf = grow(st.dataBuf, len(st.dataBuf)+len(value)+1)
+	st.dataBuf = append(st.dataBuf, '\n')
+	st.dataBuf = append(st.dataBuf, value...)
 }
 
 func ReadMessage(r io.Reader) (*Message, error) {
@@ -161,27 +187,43 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	}
 
 	msg := &Message{}
-	var spill []byte   // long-line overflow, allocated only when needed
-	var dataBuf []byte // multi-line data accumulator, allocated only when needed
+	var st readState
+	if err := readMessage(br, msg, &st); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// readMessage parses the next message from br into msg, overwriting all of
+// its fields, using st for scratch space.
+func readMessage(br *bufio.Reader, msg *Message, st *readState) error {
+	*msg = Message{}
+	st.multi = false
+	defer st.release()
+
 	haveMessage := false
 	haveData := false
 
+	finish := func() {
+		if st.multi {
+			msg.Data = string(st.dataBuf)
+		}
+	}
+
 	for {
-		line, err := readLine(br, &spill)
+		line, err := readLine(br, &st.spill)
 		if err != nil && err != io.EOF {
-			return nil, err
+			return err
 		}
 
 		if len(line) == 0 {
 			if haveMessage {
-				if dataBuf != nil {
-					msg.Data = string(dataBuf)
-				}
-				return msg, nil
+				finish()
+				return nil
 			}
 
 			if err == io.EOF {
-				return nil, io.EOF
+				return io.EOF
 			}
 
 			continue
@@ -193,7 +235,7 @@ func ReadMessage(r io.Reader) (*Message, error) {
 			if len(comment) > 0 && comment[0] == ' ' {
 				comment = comment[1:]
 			}
-			appendDataLine(msg, &dataBuf, &haveData, comment)
+			st.appendData(msg, &haveData, comment)
 		} else {
 			sep := bytes.IndexByte(line, ':')
 			field := line
@@ -209,7 +251,7 @@ func ReadMessage(r io.Reader) (*Message, error) {
 			switch string(field) {
 			case "data":
 				haveMessage = true
-				appendDataLine(msg, &dataBuf, &haveData, value)
+				st.appendData(msg, &haveData, value)
 			case "id":
 				haveMessage = true
 				if bytes.IndexByte(value, 0) < 0 {
@@ -223,12 +265,10 @@ func ReadMessage(r io.Reader) (*Message, error) {
 
 		if err == io.EOF {
 			if haveMessage {
-				if dataBuf != nil {
-					msg.Data = string(dataBuf)
-				}
-				return msg, nil
+				finish()
+				return nil
 			}
-			return nil, io.EOF
+			return io.EOF
 		}
 	}
 }
@@ -616,6 +656,8 @@ type HttpReceiver struct {
 	req        *http.Request
 	retryMax   int
 	retryDelay time.Duration
+	bufSize    int
+	rs         readState // scratch buffers, guarded by recvMux
 	respHeader func(header http.Header)
 	reqHooks   []func(req *http.Request)
 
@@ -650,7 +692,8 @@ func (r *HttpReceiver) Receive() (*Message, error) {
 			return nil, err
 		}
 
-		msg, err := ReadMessage(reader)
+		msg := &Message{}
+		err = readMessage(reader, msg, &r.rs)
 		if err == nil {
 			if msg != nil && msg.Id != "" {
 				r.mux.Lock()
@@ -755,7 +798,7 @@ func (r *HttpReceiver) connect() error {
 		}
 		r.body = resp.Body
 		if r.reader == nil {
-			r.reader = bufio.NewReaderSize(resp.Body, defaultReaderSize)
+			r.reader = bufio.NewReaderSize(resp.Body, r.bufSize)
 		} else {
 			r.reader.Reset(resp.Body)
 		}
@@ -861,6 +904,16 @@ func WithHttpReceiverRequest(fn func(req *http.Request)) HttpReceiverOption {
 	}
 }
 
+// WithHttpReceiverBufferSize sets the read buffer size (default 32 KB).
+// Lines longer than the buffer are still read, through an extra copy.
+func WithHttpReceiverBufferSize(n int) HttpReceiverOption {
+	return func(r *HttpReceiver) {
+		if n > 0 {
+			r.bufSize = n
+		}
+	}
+}
+
 // WithHttpReceiverContext ties the receiver to ctx: connecting (including the
 // initial connect in CreateHttpReceiver), reading and reconnecting stop when
 // ctx is cancelled, and Receive then returns ctx.Err().
@@ -896,6 +949,7 @@ func CreateHttpReceiver(receiverURL string, opts ...HttpReceiverOption) (*HttpRe
 		req:        req,
 		retryMax:   3,
 		retryDelay: 1 * time.Second,
+		bufSize:    defaultReceiverBufferSize,
 		parent:     context.Background(),
 	}
 
