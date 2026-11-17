@@ -199,3 +199,34 @@ func TestPusherWriteThenFlush(t *testing.T) {
 		t.Fatalf("Flush after Close = %v", err)
 	}
 }
+
+func TestPusherEncoded(t *testing.T) {
+	w := &countingFlushWriter{ResponseRecorder: *httptest.NewRecorder()}
+	p, err := CreateHttpPusher(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	base := w.flushes
+
+	frame, err := AppendMessage(nil, []byte("1"), "msg", []byte("shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.WriteEncoded(frame); err != nil {
+		t.Fatal(err)
+	}
+	if w.flushes != base {
+		t.Fatal("WriteEncoded flushed")
+	}
+	if err := p.PushEncoded(frame); err != nil {
+		t.Fatal(err)
+	}
+	if w.flushes != base+1 {
+		t.Fatal("PushEncoded did not flush")
+	}
+	want := "id: 1\nevent: msg\ndata: shared\n\n"
+	if got := w.Body.String(); got != want+want {
+		t.Fatalf("body = %q", got)
+	}
+}

@@ -365,6 +365,40 @@ func (p *HttpPusher) WriteBytes(id []byte, event string, data []byte) error {
 	return p.send(id, event, data, false)
 }
 
+// PushEncoded writes a frame produced by AppendMessage and flushes it. The
+// frame is written as is, so a fan-out server can encode an event once and
+// send the same bytes to every connection. The slice is not retained.
+func (p *HttpPusher) PushEncoded(frame []byte) error {
+	return p.sendEncoded(frame, true)
+}
+
+// WriteEncoded is PushEncoded without the flush.
+func (p *HttpPusher) WriteEncoded(frame []byte) error {
+	return p.sendEncoded(frame, false)
+}
+
+func (p *HttpPusher) sendEncoded(frame []byte, flush bool) error {
+	if p.closed.Load() {
+		return http.ErrServerClosed
+	}
+
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
+	if err := p.writeLocked(frame); err != nil {
+		return err
+	}
+	if flush {
+		if err := p.flushLocked(); err != nil {
+			return err
+		}
+	}
+	if p.pingTimer != nil {
+		p.pingTimer.Reset(p.pingDuration)
+	}
+	return nil
+}
+
 // Flush sends everything written so far to the client.
 func (p *HttpPusher) Flush() error {
 	if p.closed.Load() {
