@@ -1306,7 +1306,12 @@ func benchmarkReceive(b *testing.B, payloadSize int, into bool) {
 	b.SetBytes(int64(len(frame)))
 	var msg Message
 	for b.Loop() {
-		_, _ = into, &msg
+		if into {
+			if err := receiver.ReceiveInto(&msg); err != nil {
+				b.Fatal(err)
+			}
+			continue
+		}
 		m, err := receiver.Receive()
 		if err != nil {
 			b.Fatal(err)
@@ -1318,5 +1323,6 @@ func benchmarkReceive(b *testing.B, payloadSize int, into bool) {
 func BenchmarkReceive(b *testing.B) {
 	for _, size := range []int{16, 8 << 10} {
 		b.Run("Receive/"+strconv.Itoa(size), func(b *testing.B) { benchmarkReceive(b, size, false) })
+		b.Run("ReceiveInto/"+strconv.Itoa(size), func(b *testing.B) { benchmarkReceive(b, size, true) })
 	}
 }

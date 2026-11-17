@@ -164,6 +164,7 @@ type readState struct {
 	dataBuf []byte // multi-line data accumulator
 	multi   bool   // dataBuf holds the data of the current message
 	maxSize int    // bytes allowed per message, 0 for no limit
+	event   string // last event name seen, reused across messages
 }
 
 // release drops buffers that grew past maxReadBufferRetain, so one huge
@@ -279,7 +280,12 @@ func readMessage(br *bufio.Reader, msg *Message, st *readState) error {
 				}
 			case "event":
 				haveMessage = true
-				msg.Event = string(value)
+				// streams reuse a handful of event names; keep the last one
+				// so repeated names do not allocate
+				if string(value) != st.event {
+					st.event = string(value)
+				}
+				msg.Event = st.event
 			}
 		}
 
@@ -685,61 +691,76 @@ type HttpReceiver struct {
 	ctx    context.Context // parent plus Close
 	cancel context.CancelFunc
 
-	lastEventID string
-	closed      atomic.Bool
-	mux         sync.Mutex
+	// recvMux serializes Receive. It guards everything on the read path,
+	// so receiving a message takes no other lock.
 	recvMux     sync.Mutex
-	body        io.ReadCloser
+	lastEventID string
 	reader      *bufio.Reader // reused across reconnects
+	connected   bool          // reader is attached to a live body
+
+	closed atomic.Bool
+	mux    sync.Mutex // guards body, which Close touches concurrently
+	body   io.ReadCloser
 }
 
 var _ Receiver = (*HttpReceiver)(nil)
 
+// Receive returns the next message, reconnecting (with Last-Event-ID) when
+// the stream drops.
 func (r *HttpReceiver) Receive() (*Message, error) {
+	msg := &Message{}
+	if err := r.ReceiveInto(msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// ReceiveInto is Receive without allocating a Message: every field of msg is
+// overwritten with the next message. Reusing one msg across calls avoids an
+// allocation per message; the strings it holds are never mutated.
+func (r *HttpReceiver) ReceiveInto(msg *Message) error {
 	r.recvMux.Lock()
 	defer r.recvMux.Unlock()
 
 	for {
 		if err := r.done(); err != nil {
-			return nil, err
+			return err
 		}
 
 		reader, err := r.getReader()
 		if err != nil {
-			if err := r.done(); err != nil {
-				return nil, err
+			if derr := r.done(); derr != nil {
+				return derr
 			}
-			return nil, err
+			return err
 		}
 
-		msg := &Message{}
 		err = readMessage(reader, msg, &r.rs)
 		if err == nil {
-			if msg != nil && msg.Id != "" {
-				r.mux.Lock()
+			if msg.Id != "" {
 				r.lastEventID = msg.Id
-				r.mux.Unlock()
 			}
-			return msg, nil
+			return nil
 		}
 
-		if err := r.done(); err != nil {
-			return nil, err
+		if derr := r.done(); derr != nil {
+			return derr
 		}
 
+		r.connected = false
 		r.closeBody()
 
 		if errors.Is(err, ErrMessageTooLarge) {
 			// the stream is mid-message; reconnecting would most likely
 			// replay the same message, so let the caller decide
-			return nil, err
+			return err
 		}
 
 		if err := r.connect(); err != nil {
-			if err := r.done(); err != nil {
-				return nil, err
+			if derr := r.done(); derr != nil {
+				return derr
 			}
-			return nil, err
+			return err
 		}
 	}
 }
@@ -779,11 +800,8 @@ func (r *HttpReceiver) connect() error {
 
 		req := r.req.Clone(r.ctx)
 
-		r.mux.Lock()
-		lastEventID := r.lastEventID
-		r.mux.Unlock()
-		if lastEventID != "" {
-			req.Header.Set("Last-Event-ID", lastEventID)
+		if r.lastEventID != "" {
+			req.Header.Set("Last-Event-ID", r.lastEventID)
 		}
 
 		for _, hook := range r.reqHooks {
@@ -823,12 +841,14 @@ func (r *HttpReceiver) connect() error {
 			_ = r.body.Close()
 		}
 		r.body = resp.Body
+		r.mux.Unlock()
+
 		if r.reader == nil {
 			r.reader = bufio.NewReaderSize(resp.Body, r.bufSize)
 		} else {
 			r.reader.Reset(resp.Body)
 		}
-		r.mux.Unlock()
+		r.connected = true
 		return nil
 	}
 
@@ -866,27 +886,15 @@ func (r *HttpReceiver) closeBody() {
 	}
 }
 
+// getReader returns the reader of the current connection, connecting first
+// if there is none. Must be called with recvMux held.
 func (r *HttpReceiver) getReader() (*bufio.Reader, error) {
-	r.mux.Lock()
-	reader, connected := r.reader, r.body != nil
-	r.mux.Unlock()
-
-	if connected {
-		return reader, nil
+	if !r.connected {
+		if err := r.connect(); err != nil {
+			return nil, err
+		}
 	}
-
-	if err := r.connect(); err != nil {
-		return nil, err
-	}
-
-	r.mux.Lock()
-	reader, connected = r.reader, r.body != nil
-	r.mux.Unlock()
-	if !connected {
-		return nil, io.EOF
-	}
-
-	return reader, nil
+	return r.reader, nil
 }
 
 type HttpReceiverOption func(*HttpReceiver)

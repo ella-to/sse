@@ -142,3 +142,26 @@ func TestReceiverMaxMessageSize(t *testing.T) {
 		t.Fatalf("Receive = %v, %v", m, err)
 	}
 }
+
+func TestReceiveIntoOverwritesFields(t *testing.T) {
+	server := streamServer(t, "id: 1\nevent: a\ndata: x\n\nid: 2\ndata: y\n\nevent: a\ndata: z\n\n")
+	r, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	var m Message
+	for _, want := range []Message{
+		{Id: "1", Event: "a", Data: "x"},
+		{Id: "2", Data: "y"},
+		{Event: "a", Data: "z"},
+	} {
+		if err := r.ReceiveInto(&m); err != nil {
+			t.Fatal(err)
+		}
+		if m != want {
+			t.Fatalf("got %+v, want %+v", m, want)
+		}
+	}
+}
