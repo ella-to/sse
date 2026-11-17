@@ -263,3 +263,20 @@ func TestPusherPingOnlyWhenIdle(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestPusherDisablesProxyBuffering(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if _, err := CreateHttpPusher(rec); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("X-Accel-Buffering = %q", got)
+	}
+	rec = httptest.NewRecorder()
+	if _, err := CreateHttpPusher(rec, WithHttpPusherHeader("X-Accel-Buffering", "yes")); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Header().Get("X-Accel-Buffering"); got != "yes" {
+		t.Fatalf("override X-Accel-Buffering = %q", got)
+	}
+}

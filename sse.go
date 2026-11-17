@@ -582,6 +582,8 @@ func CreateHttpPusher(w http.ResponseWriter, opts ...HttpPusherOption) (*HttpPus
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	// stop nginx and compatible proxies from buffering the stream
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	for _, opt := range opts {
 		opt(pusher)
