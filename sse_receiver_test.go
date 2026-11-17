@@ -302,3 +302,15 @@ func TestParseRetry(t *testing.T) {
 		}
 	}
 }
+
+func TestReceiverSizeLimitIgnoresBlankLines(t *testing.T) {
+	server := streamServer(t, strings.Repeat("\n", 5000)+"id: 1\ndata: ok\n\n")
+	r, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()), WithHttpReceiverMaxMessageSize(100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if m, err := r.Receive(); err != nil || m.Data != "ok" {
+		t.Fatalf("Receive = %v, %v", m, err)
+	}
+}

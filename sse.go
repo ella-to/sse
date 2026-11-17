@@ -268,6 +268,8 @@ func readMessage(br *bufio.Reader, msg *Message, st *readState) error {
 				return io.EOF
 			}
 
+			// blank lines between messages are not part of any message
+			size = 0
 			continue
 		}
 
