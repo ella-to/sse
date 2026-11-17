@@ -109,3 +109,36 @@ func TestReceiverReusesBuffersSafely(t *testing.T) {
 		}
 	}
 }
+
+func TestReceiverMaxMessageSize(t *testing.T) {
+	big := strings.Repeat("B", 4096)
+	for _, body := range []string{
+		"id: 1\ndata: " + big + "\n\nid: 2\ndata: ok\n\n",              // one long line
+		"id: 1\n" + strings.Repeat("data: "+big[:100]+"\n", 50) + "\n", // many lines
+	} {
+		server := streamServer(t, body)
+		r, err := CreateHttpReceiver(server.URL,
+			WithHttpReceiverClient(server.Client()),
+			WithHttpReceiverBufferSize(64),
+			WithHttpReceiverMaxMessageSize(1024),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Receive(); !errors.Is(err, ErrMessageTooLarge) {
+			t.Fatalf("Receive error = %v, want ErrMessageTooLarge", err)
+		}
+		r.Close()
+	}
+
+	// within the limit
+	server := streamServer(t, "id: 1\ndata: "+big[:500]+"\n\n")
+	r, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()), WithHttpReceiverMaxMessageSize(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if m, err := r.Receive(); err != nil || len(m.Data) != 500 {
+		t.Fatalf("Receive = %v, %v", m, err)
+	}
+}

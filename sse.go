@@ -28,6 +28,9 @@ const (
 	// exceed the 4 KB that ReadMessage uses for plain readers.
 	defaultReceiverBufferSize = 32 << 10
 
+	// defaultMaxMessageSize bounds a single message on an HttpReceiver.
+	defaultMaxMessageSize = 16 << 20
+
 	// maxReadBufferRetain caps the scratch capacity a receiver keeps between
 	// messages.
 	maxReadBufferRetain = 1 << 20
@@ -61,6 +64,11 @@ func validField[T string | []byte](s T, isID bool) bool {
 	}
 	return true
 }
+
+// ErrMessageTooLarge is returned by HttpReceiver when a message exceeds the
+// configured maximum size (see WithHttpReceiverMaxMessageSize). The
+// connection is dropped; the next Receive reconnects.
+var ErrMessageTooLarge = errors.New("sse: message too large")
 
 // StatusError is returned (wrapped) by CreateHttpReceiver and Receive when
 // the server answers a stream request with a status other than 200 OK.
@@ -112,7 +120,10 @@ func appendGrow(dst, src []byte) []byte {
 // readLine returns the next line from br without its line ending. The
 // returned slice aliases br's internal buffer (or *spill for lines longer
 // than that buffer) and is only valid until the next call.
-func readLine(br *bufio.Reader, spill *[]byte) ([]byte, error) {
+//
+// A positive limit bounds how many bytes a spilled line may accumulate;
+// longer lines fail with ErrMessageTooLarge.
+func readLine(br *bufio.Reader, spill *[]byte, limit int) ([]byte, error) {
 	line, err := br.ReadSlice('\n')
 	if err == nil {
 		return trimLineEnd(line), nil
@@ -132,6 +143,10 @@ func readLine(br *bufio.Reader, spill *[]byte) ([]byte, error) {
 		if err != bufio.ErrBufferFull {
 			break
 		}
+		if limit > 0 && len(buf) > limit {
+			*spill = buf
+			return nil, ErrMessageTooLarge
+		}
 	}
 	*spill = buf
 
@@ -148,6 +163,7 @@ type readState struct {
 	spill   []byte // long-line overflow
 	dataBuf []byte // multi-line data accumulator
 	multi   bool   // dataBuf holds the data of the current message
+	maxSize int    // bytes allowed per message, 0 for no limit
 }
 
 // release drops buffers that grew past maxReadBufferRetain, so one huge
@@ -203,6 +219,7 @@ func readMessage(br *bufio.Reader, msg *Message, st *readState) error {
 
 	haveMessage := false
 	haveData := false
+	size := 0
 
 	finish := func() {
 		if st.multi {
@@ -211,9 +228,12 @@ func readMessage(br *bufio.Reader, msg *Message, st *readState) error {
 	}
 
 	for {
-		line, err := readLine(br, &st.spill)
+		line, err := readLine(br, &st.spill, st.maxSize)
 		if err != nil && err != io.EOF {
 			return err
+		}
+		if size += len(line) + 1; st.maxSize > 0 && size > st.maxSize {
+			return ErrMessageTooLarge
 		}
 
 		if len(line) == 0 {
@@ -709,6 +729,12 @@ func (r *HttpReceiver) Receive() (*Message, error) {
 
 		r.closeBody()
 
+		if errors.Is(err, ErrMessageTooLarge) {
+			// the stream is mid-message; reconnecting would most likely
+			// replay the same message, so let the caller decide
+			return nil, err
+		}
+
 		if err := r.connect(); err != nil {
 			if err := r.done(); err != nil {
 				return nil, err
@@ -914,6 +940,15 @@ func WithHttpReceiverBufferSize(n int) HttpReceiverOption {
 	}
 }
 
+// WithHttpReceiverMaxMessageSize bounds the size of a single message
+// (default 16 MB); n <= 0 removes the limit. A larger message makes Receive
+// return ErrMessageTooLarge and drops the connection.
+func WithHttpReceiverMaxMessageSize(n int) HttpReceiverOption {
+	return func(r *HttpReceiver) {
+		r.rs.maxSize = max(n, 0)
+	}
+}
+
 // WithHttpReceiverContext ties the receiver to ctx: connecting (including the
 // initial connect in CreateHttpReceiver), reading and reconnecting stop when
 // ctx is cancelled, and Receive then returns ctx.Err().
@@ -950,6 +985,7 @@ func CreateHttpReceiver(receiverURL string, opts ...HttpReceiverOption) (*HttpRe
 		retryMax:   3,
 		retryDelay: 1 * time.Second,
 		bufSize:    defaultReceiverBufferSize,
+		rs:         readState{maxSize: defaultMaxMessageSize},
 		parent:     context.Background(),
 	}
 
