@@ -43,3 +43,37 @@ func TestPushRejectsLineBreaks(t *testing.T) {
 		t.Fatalf("output = %q", out)
 	}
 }
+
+// Browsers do not dispatch an event whose data buffer is empty unless a data
+// line is present, so non-comment messages always carry one (SSE-B8).
+func TestWriteMessageEmptyData(t *testing.T) {
+	cases := []struct {
+		msg  *Message
+		want string
+	}{
+		{&Message{Event: "done"}, "event: done\ndata:\n\n"},
+		{&Message{Id: "7"}, "id: 7\ndata:\n\n"},
+		{&Message{}, "\n"}, // empty comment stays a bare separator
+		{&Message{Data: "ping"}, ": ping\n\n"},
+	}
+	for _, c := range cases {
+		var out, buf bytes.Buffer
+		if err := WriteMessage(&out, c.msg, &buf); err != nil {
+			t.Fatal(err)
+		}
+		if out.String() != c.want {
+			t.Errorf("WriteMessage(%+v) = %q, want %q", *c.msg, out.String(), c.want)
+		}
+
+		if c.msg.Event == "" && c.msg.Id == "" {
+			continue
+		}
+		got, err := ReadMessage(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *got != *c.msg {
+			t.Errorf("round trip = %+v, want %+v", *got, *c.msg)
+		}
+	}
+}

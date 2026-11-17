@@ -262,6 +262,11 @@ func WriteMessage(w io.Writer, msg *Message, buf *bytes.Buffer) error {
 		isComment = false
 	}
 
+	if msg.Data == "" && !isComment {
+		// without a data line browsers do not dispatch the event
+		buf.WriteString("data:\n")
+	}
+
 	if msg.Data != "" {
 		prefix := "data: "
 		if isComment {
