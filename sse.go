@@ -328,13 +328,17 @@ type Pusher interface {
 
 type HttpPusher struct {
 	w            http.ResponseWriter
-	flusher      http.Flusher
+	rc           *http.ResponseController
 	closer       io.Closer
 	pingDuration time.Duration
 	pingTimer    *time.Timer
+	writeTimeout time.Duration
 	closed       atomic.Bool
-	mux          sync.Mutex
-	buf          []byte // scratch frame buffer, reused across pushes
+	// writing is set while a write or flush to the connection is in
+	// progress, so Close can abort one that is stuck on a stalled peer.
+	writing atomic.Bool
+	mux     sync.Mutex
+	buf     []byte // scratch frame buffer, reused across pushes
 }
 
 var _ Pusher = (*HttpPusher)(nil)
@@ -358,15 +362,11 @@ func (p *HttpPusher) send(id []byte, event string, data []byte) error {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 
-	if p.closed.Load() {
-		return http.ErrServerClosed
-	}
-
 	frame, err := AppendMessage(p.buf[:0], id, event, data)
 	if err != nil {
 		return err
 	}
-	_, err = p.w.Write(frame)
+	err = p.writeLocked(frame)
 	if cap(frame) <= maxPushBufferRetain {
 		p.buf = frame
 	} else {
@@ -376,7 +376,9 @@ func (p *HttpPusher) send(id []byte, event string, data []byte) error {
 		return err
 	}
 
-	p.flusher.Flush()
+	if err := p.flushLocked(); err != nil {
+		return err
+	}
 
 	// Reset the idle keepalive only after a successful write, so a dead
 	// connection does not keep re-arming its own ping chain forever.
@@ -387,15 +389,64 @@ func (p *HttpPusher) send(id []byte, event string, data []byte) error {
 	return nil
 }
 
+// beginIO marks a connection write as in progress and applies the write
+// timeout. It fails if the pusher is closed. Must be called with p.mux held
+// and paired with p.writing.Store(false).
+//
+// The store of writing before the load of closed pairs with Close storing
+// closed before loading writing: at least one side observes the other, so
+// Close never misses a write it would have to abort.
+func (p *HttpPusher) beginIO() error {
+	if p.writeTimeout > 0 {
+		_ = p.rc.SetWriteDeadline(time.Now().Add(p.writeTimeout))
+	}
+	p.writing.Store(true)
+	if p.closed.Load() {
+		p.writing.Store(false)
+		return http.ErrServerClosed
+	}
+	return nil
+}
+
+func (p *HttpPusher) writeLocked(frame []byte) error {
+	if err := p.beginIO(); err != nil {
+		return err
+	}
+	_, err := p.w.Write(frame)
+	p.writing.Store(false)
+	return err
+}
+
+func (p *HttpPusher) flushLocked() error {
+	if err := p.beginIO(); err != nil {
+		return err
+	}
+	err := p.rc.Flush()
+	p.writing.Store(false)
+	return err
+}
+
+// Close stops the pusher. A write blocked on a peer that stopped reading is
+// aborted by moving the connection's write deadline into the past, so Close
+// never waits on a stalled client.
 func (p *HttpPusher) Close() error {
 	if p.closed.Swap(true) {
 		return http.ErrServerClosed
+	}
+
+	aborted := p.writing.Load()
+	if aborted {
+		_ = p.rc.SetWriteDeadline(time.Unix(1, 0))
 	}
 
 	p.mux.Lock()
 	if p.pingTimer != nil {
 		p.pingTimer.Stop()
 		p.pingTimer = nil
+	}
+	if p.writeTimeout > 0 && !aborted {
+		// let the server finish the response without our deadline
+		_ = p.rc.SetWriteDeadline(time.Time{})
 	}
 	closer := p.closer
 	p.mux.Unlock()
@@ -421,15 +472,20 @@ func WithHttpPusherPingDuration(d time.Duration) HttpPusherOption {
 	}
 }
 
-func CreateHttpPusher(w http.ResponseWriter, opts ...HttpPusherOption) (*HttpPusher, error) {
-	out, ok := w.(http.Flusher)
-	if !ok {
-		return nil, http.ErrNotSupported
+// WithHttpPusherWriteTimeout bounds every write and flush (pings included)
+// with a connection write deadline, so a client that stops reading cannot
+// block the pusher forever. Requires a ResponseWriter that supports
+// http.ResponseController.SetWriteDeadline; otherwise it has no effect.
+func WithHttpPusherWriteTimeout(d time.Duration) HttpPusherOption {
+	return func(p *HttpPusher) {
+		p.writeTimeout = d
 	}
+}
 
+func CreateHttpPusher(w http.ResponseWriter, opts ...HttpPusherOption) (*HttpPusher, error) {
 	pusher := &HttpPusher{
-		w:       w,
-		flusher: out,
+		w:  w,
+		rc: http.NewResponseController(w),
 	}
 	if closer, ok := w.(io.Closer); ok {
 		pusher.closer = closer
@@ -442,7 +498,13 @@ func CreateHttpPusher(w http.ResponseWriter, opts ...HttpPusherOption) (*HttpPus
 		opt(pusher)
 	}
 
-	out.Flush()
+	// flushing sends the headers; it also detects writers that cannot stream
+	if err := pusher.rc.Flush(); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			return nil, http.ErrNotSupported
+		}
+		return nil, err
+	}
 
 	if pusher.pingDuration > 0 {
 		pusher.pingTimer = time.AfterFunc(pusher.pingDuration, func() {
