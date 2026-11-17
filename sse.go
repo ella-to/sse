@@ -345,16 +345,39 @@ var _ Pusher = (*HttpPusher)(nil)
 
 // Push writes msg and flushes it to the client.
 func (p *HttpPusher) Push(msg *Message) error {
-	return p.send(bytesOf(msg.Id), msg.Event, bytesOf(msg.Data))
+	return p.send(bytesOf(msg.Id), msg.Event, bytesOf(msg.Data), true)
 }
 
 // PushBytes is Push for a message held as byte slices. It writes and flushes
 // one frame without converting data to a string; the slices are not retained.
 func (p *HttpPusher) PushBytes(id []byte, event string, data []byte) error {
-	return p.send(id, event, data)
+	return p.send(id, event, data, true)
 }
 
-func (p *HttpPusher) send(id []byte, event string, data []byte) error {
+// WriteMsg writes msg without flushing. Use it to send a burst of messages
+// followed by a single Flush.
+func (p *HttpPusher) WriteMsg(msg *Message) error {
+	return p.send(bytesOf(msg.Id), msg.Event, bytesOf(msg.Data), false)
+}
+
+// WriteBytes is WriteMsg for a message held as byte slices.
+func (p *HttpPusher) WriteBytes(id []byte, event string, data []byte) error {
+	return p.send(id, event, data, false)
+}
+
+// Flush sends everything written so far to the client.
+func (p *HttpPusher) Flush() error {
+	if p.closed.Load() {
+		return http.ErrServerClosed
+	}
+
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
+	return p.flushLocked()
+}
+
+func (p *HttpPusher) send(id []byte, event string, data []byte, flush bool) error {
 	if p.closed.Load() {
 		return http.ErrServerClosed
 	}
@@ -376,8 +399,10 @@ func (p *HttpPusher) send(id []byte, event string, data []byte) error {
 		return err
 	}
 
-	if err := p.flushLocked(); err != nil {
-		return err
+	if flush {
+		if err := p.flushLocked(); err != nil {
+			return err
+		}
 	}
 
 	// Reset the idle keepalive only after a successful write, so a dead

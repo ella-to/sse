@@ -154,3 +154,48 @@ func TestPusherRequiresFlush(t *testing.T) {
 		t.Fatalf("error = %v, want ErrNotSupported", err)
 	}
 }
+
+// countingFlushWriter records writes and how many flushes were requested.
+type countingFlushWriter struct {
+	httptest.ResponseRecorder
+	flushes int
+}
+
+func (w *countingFlushWriter) Flush() { w.flushes++ }
+
+func TestPusherWriteThenFlush(t *testing.T) {
+	w := &countingFlushWriter{ResponseRecorder: *httptest.NewRecorder()}
+	p, err := CreateHttpPusher(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	base := w.flushes // CreateHttpPusher flushes the headers
+
+	if err := p.WriteMsg(&Message{Id: "1", Data: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.WriteBytes([]byte("2"), "", []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if w.flushes != base {
+		t.Fatalf("Write* flushed %d times", w.flushes-base)
+	}
+	if err := p.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if w.flushes != base+1 {
+		t.Fatalf("flushes = %d, want 1", w.flushes-base)
+	}
+	if got := w.Body.String(); got != "id: 1\ndata: a\n\nid: 2\ndata: b\n\n" {
+		t.Fatalf("body = %q", got)
+	}
+
+	p.Close()
+	if err := p.WriteMsg(&Message{Data: "x"}); !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("WriteMsg after Close = %v", err)
+	}
+	if err := p.Flush(); !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("Flush after Close = %v", err)
+	}
+}
