@@ -697,6 +697,7 @@ type HttpReceiver struct {
 	lastEventID string
 	reader      *bufio.Reader // reused across reconnects
 	connected   bool          // reader is attached to a live body
+	terminal    error         // set once the server answered 204: never reconnect
 
 	closed atomic.Bool
 	mux    sync.Mutex // guards body, which Close touches concurrently
@@ -792,6 +793,10 @@ func (r *HttpReceiver) connect() error {
 		attempts = 1
 	}
 
+	if r.terminal != nil {
+		return r.terminal
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := r.done(); err != nil {
@@ -821,6 +826,14 @@ func (r *HttpReceiver) connect() error {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxStatusErrorBody))
 			resp.Body.Close()
 			lastErr = &StatusError{Code: resp.StatusCode, Body: string(body)}
+			if permanentStatus(resp.StatusCode) {
+				err := fmt.Errorf("failed to connect: %w", lastErr)
+				if resp.StatusCode == http.StatusNoContent {
+					// the server asked the client to stop reconnecting
+					r.terminal = err
+				}
+				return err
+			}
 			if !r.waitRetry(attempt, attempts) {
 				return r.done()
 			}
@@ -857,6 +870,20 @@ func (r *HttpReceiver) connect() error {
 	}
 
 	return fmt.Errorf("failed to connect after %d attempts: %w", attempts, lastErr)
+}
+
+// permanentStatus reports whether retrying a stream request that got this
+// status is pointless: client errors other than timeouts and rate limits, and
+// 204 No Content, which tells an event-stream client to stop reconnecting.
+func permanentStatus(code int) bool {
+	if code == http.StatusNoContent {
+		return true
+	}
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+		return false
+	}
+	return code >= 400 && code < 500
 }
 
 func (r *HttpReceiver) waitRetry(attempt, attempts int) bool {

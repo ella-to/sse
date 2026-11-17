@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -163,5 +164,65 @@ func TestReceiveIntoOverwritesFields(t *testing.T) {
 		if m != want {
 			t.Fatalf("got %+v, want %+v", m, want)
 		}
+	}
+}
+
+func TestReceiverDoesNotRetryPermanentStatus(t *testing.T) {
+	for _, tc := range []struct {
+		code  int
+		tries int32
+	}{
+		{http.StatusUnauthorized, 1},
+		{http.StatusNotFound, 1},
+		{http.StatusNoContent, 1},
+		{http.StatusTooManyRequests, 3},
+		{http.StatusServiceUnavailable, 3},
+	} {
+		var calls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			w.WriteHeader(tc.code)
+		}))
+		_, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()), WithHttpReceiverRetry(3, time.Millisecond))
+		server.Close()
+
+		var se *StatusError
+		if !errors.As(err, &se) || se.Code != tc.code {
+			t.Fatalf("status %d: error = %v", tc.code, err)
+		}
+		if got := calls.Load(); got != tc.tries {
+			t.Errorf("status %d: %d requests, want %d", tc.code, got, tc.tries)
+		}
+	}
+}
+
+func TestReceiverStopsAfterNoContent(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "id: 1\ndata: last\n\n")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	r, err := CreateHttpReceiver(server.URL, WithHttpReceiverClient(server.Client()), WithHttpReceiverRetry(3, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Receive(); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		var se *StatusError
+		if _, err := r.Receive(); !errors.As(err, &se) || se.Code != http.StatusNoContent {
+			t.Fatalf("Receive error = %v, want 204 StatusError", err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("%d requests, want 2 (no reconnect after 204)", got)
 	}
 }
